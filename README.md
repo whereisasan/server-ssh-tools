@@ -1,4 +1,4 @@
-# 🔐 Secure SSH Setup Script
+# server-ssh-tools
 
 Этот скрипт автоматически настраивает **SSH-сервер** максимально безопасным образом:  
 - применяет рекомендуемые параметры безопасности в `sshd_config`;  
@@ -21,7 +21,7 @@
 
 ### 0. Быстрый запуск одной командой
 ```bash
-curl -s https://raw.githubusercontent.com/whereisasan/server-ssh-tools/main/secure_ssh.sh | bash
+curl -s https://raw.githubusercontent.com/whereisasan/server-ssh-tools/refs/heads/main/secure_ssh.sh | bash
 ```
 ### 1. Склонировать репозиторий
 ```bash
