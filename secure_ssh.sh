@@ -73,6 +73,15 @@ set_param "AllowTcpForwarding" "no"
 set_param "LogLevel" "INFO"
 set_param "Banner" "$BANNER_FILE"
 
+# Комментируем AcceptEnv LANG LC_* если он есть
+if grep -qE "^\s*AcceptEnv LANG LC_\*" $CONFIG; then
+    sed -i "s|^\s*AcceptEnv LANG LC_\*|#AcceptEnv LANG LC_*|" $CONFIG
+    echo "[UPDATE] AcceptEnv LANG LC_* закомментирован"
+    RESTART=1
+else
+    echo "[OK] AcceptEnv LANG LC_* уже закомментирован или отсутствует"
+fi
+
 # Устанавливаем баннер (идемпотентно)
 if [ -f "$BANNER_FILE" ] && cmp -s <(echo "$BANNER_TEXT") "$BANNER_FILE"; then
     echo "[OK] Баннер уже установлен и совпадает"
