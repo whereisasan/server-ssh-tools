@@ -32,6 +32,25 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Проверка наличия необходимых команд
+REQUIRED_CMDS=(curl sshd systemctl flock)
+MISSING_CMDS=()
+for cmd in "${REQUIRED_CMDS[@]}"; do
+    command -v "$cmd" >/dev/null 2>&1 || MISSING_CMDS+=("$cmd")
+done
+if [ "${#MISSING_CMDS[@]}" -gt 0 ]; then
+    echo "[ERROR] Не найдены необходимые команды: ${MISSING_CMDS[*]}"
+    exit 1
+fi
+
+# Не даём запустить два экземпляра скрипта одновременно
+LOCK_FILE="/var/lock/secure_ssh.sh.lock"
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    echo "[ERROR] Другой экземпляр скрипта уже выполняется"
+    exit 1
+fi
+
 # Проверка, что похоже на валидный SSH-публичный ключ
 is_valid_pubkey() {
     local line="$1"
@@ -40,7 +59,7 @@ is_valid_pubkey() {
 
 # Загружаем публичные ключи с GitHub
 echo "[INFO] Загружаю публичные ключи с GitHub пользователя $GITHUB_USER..."
-if ! RAW_KEYS=$(curl -fsSL "https://github.com/${GITHUB_USER}.keys"); then
+if ! RAW_KEYS=$(curl -fsSL --connect-timeout 10 --max-time 20 "https://github.com/${GITHUB_USER}.keys"); then
     echo "[ERROR] Не удалось загрузить ключи с GitHub (сетевая ошибка или пользователь/ключи не найдены)"
     exit 1
 fi
@@ -104,6 +123,13 @@ comment_param() {
     fi
 }
 
+# Определяем версию OpenSSH, чтобы решить, доступен ли KbdInteractiveAuthentication
+# (введён в OpenSSH 8.7 взамен устаревшего ChallengeResponseAuthentication)
+version_ge() {
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+OPENSSH_VERSION="$(sshd -V 2>&1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
+
 # Основные параметры безопасности
 set_param "Port" "22"
 set_param "Protocol" "2"
@@ -112,6 +138,11 @@ set_param "PasswordAuthentication" "no"
 set_param "PermitEmptyPasswords" "no"
 set_param "PubkeyAuthentication" "yes"
 set_param "ChallengeResponseAuthentication" "no"
+if [ -n "$OPENSSH_VERSION" ] && version_ge "$OPENSSH_VERSION" "8.7"; then
+    set_param "KbdInteractiveAuthentication" "no"
+else
+    echo "[INFO] OpenSSH < 8.7 или версия не определена — KbdInteractiveAuthentication не добавляется"
+fi
 set_param "UsePAM" "yes"
 set_param "LoginGraceTime" "30"
 set_param "MaxAuthTries" "3"
@@ -132,6 +163,10 @@ else
     echo "[UPDATE] Баннер записан в $BANNER_FILE"
     RESTART=1
 fi
+
+# Приводим права и владельца sshd_config к безопасным значениям
+chown root:root "$CONFIG"
+chmod 600 "$CONFIG"
 
 # Проверяем синтаксис конфига перед перезапуском; при ошибке — откат
 if ! sshd -t -f "$CONFIG"; then
@@ -154,6 +189,17 @@ for key in "${VALID_KEYS[@]}"; do
         echo "[ADD] Новый ключ добавлен в $AUTH_KEYS"
     fi
 done
+
+# На системах с SELinux (RHEL/CentOS) нужно восстановить контексты,
+# иначе sshd может отказаться использовать authorized_keys
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" != "Disabled" ]; then
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -R "$SSH_DIR"
+        echo "[INFO] SELinux-контексты для $SSH_DIR восстановлены"
+    else
+        echo "[WARN] SELinux активен, но restorecon не найден — контексты для $SSH_DIR не обновлены"
+    fi
+fi
 
 # Перезапуск SSH только если были изменения
 if [ "$RESTART" == "1" ]; then
