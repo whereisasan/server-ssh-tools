@@ -1,13 +1,18 @@
+# OS
 .DS_Store
 Thumbs.db
 desktop.ini
+.nfs*
+
+# Editors
 *.swp
 *.swo
 *~
-.nfs*
 .vscode/
 .idea/
 *.iml
+
+# Backups and runtime artifacts
 *.bak
 *.backup
 *.old
@@ -17,20 +22,15 @@ desktop.ini
 *.err
 *.pid
 *.sock
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Ansible / Terraform
 *.retry
 *.tfstate
 *.tfstate.*
 .terraform/
-*.bak
-*.old
-*.orig
-*.log
-*.swp
-*.swo
-*~
-.vscode/
-.idea/

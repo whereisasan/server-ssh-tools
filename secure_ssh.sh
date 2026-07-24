@@ -2,15 +2,31 @@
 set -euo pipefail
 
 CONFIG="/etc/ssh/sshd_config"
-ORIG_BACKUP="/etc/ssh/sshd_config.orig.bak"
-RUN_BACKUP="/etc/ssh/sshd_config.pre-run.bak"
 SSH_DIR="/root/.ssh"
 AUTH_KEYS="$SSH_DIR/authorized_keys"
 BANNER_FILE="/etc/issue.net"
+LOCK_FILE="/var/lock/secure_ssh.sh.lock"
+BACKUP_DIR="/var/backups/secure_ssh"
+ORIG_BACKUP="$BACKUP_DIR/sshd_config.orig"
+PRERUN_DIR="$BACKUP_DIR/pre-run"
+
+MARK_BEGIN="# >>> secure_ssh.sh managed block >>>"
+MARK_END="# <<< secure_ssh.sh managed block <<<"
+
 RESTART=0
+SNAPSHOT=""
+DROPIN_DIR=""
+DROPIN_FILE=""
 
 # === GitHub username ===
 GITHUB_USER="whereisasan"
+
+# === Ограничение списка пользователей (по умолчанию выключено) ===
+# Задаётся через окружение, т.к. неверное значение приводит к потере доступа:
+#   SSH_ALLOW_USERS="root deploy" ./secure_ssh.sh
+#   SSH_ALLOW_GROUPS="sshusers" ./secure_ssh.sh
+SSH_ALLOW_USERS="${SSH_ALLOW_USERS:-}"
+SSH_ALLOW_GROUPS="${SSH_ALLOW_GROUPS:-}"
 
 # === Текст баннера (можно кастомизировать) ===
 BANNER_TEXT=$(cat <<EOF
@@ -26,14 +42,16 @@ Unauthorized access is prohibited!
 EOF
 )
 
-# Проверка, что скрипт запущен от root
+# ---------------------------------------------------------------------------
+# Предварительные проверки
+# ---------------------------------------------------------------------------
+
 if [ "$EUID" -ne 0 ]; then
     echo "[ERROR] Скрипт должен запускаться от root"
     exit 1
 fi
 
-# Проверка наличия необходимых команд
-REQUIRED_CMDS=(curl sshd systemctl flock)
+REQUIRED_CMDS=(curl sshd systemctl flock awk cmp mktemp)
 MISSING_CMDS=()
 for cmd in "${REQUIRED_CMDS[@]}"; do
     command -v "$cmd" >/dev/null 2>&1 || MISSING_CMDS+=("$cmd")
@@ -43,21 +61,118 @@ if [ "${#MISSING_CMDS[@]}" -gt 0 ]; then
     exit 1
 fi
 
+if [ ! -f "$CONFIG" ]; then
+    echo "[ERROR] Не найден $CONFIG"
+    exit 1
+fi
+
 # Не даём запустить два экземпляра скрипта одновременно
-LOCK_FILE="/var/lock/secure_ssh.sh.lock"
 exec 200>"$LOCK_FILE"
 if ! flock -n 200; then
     echo "[ERROR] Другой экземпляр скрипта уже выполняется"
     exit 1
 fi
 
-# Проверка, что похоже на валидный SSH-публичный ключ
+cleanup() {
+    [ -n "$SNAPSHOT" ] && [ -d "$SNAPSHOT" ] && rm -rf "$SNAPSHOT"
+    return 0
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Вспомогательные функции
+# ---------------------------------------------------------------------------
+
+version_ge() {
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+
 is_valid_pubkey() {
     local line="$1"
     [[ "$line" =~ ^(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)\ [A-Za-z0-9+/]+=*([[:space:]].*)?$ ]]
 }
 
-# Загружаем публичные ключи с GitHub
+# Комментирует активные вхождения ключевого слова в глобальной секции файла.
+# Строки внутри Match-блоков и внутри управляемого блока не трогаются.
+comment_key() {
+    local file="$1" key="$2"
+    [ -f "$file" ] || return 0
+
+    local tmp
+    tmp=$(mktemp)
+    awk -v key="$key" -v mb="$MARK_BEGIN" -v me="$MARK_END" '
+        BEGIN { inmatch = 0; inblock = 0 }
+        $0 == mb { inblock = 1; print; next }
+        $0 == me { inblock = 0; print; next }
+        inblock  { print; next }
+        {
+            if (tolower($1) == "match") inmatch = 1
+            if (!inmatch && tolower($1) == tolower(key)) {
+                print "#" $0
+                next
+            }
+            print
+        }
+    ' "$file" > "$tmp"
+
+    if cmp -s "$tmp" "$file"; then
+        rm -f "$tmp"
+    else
+        cat "$tmp" > "$file"   # cat, а не mv — сохраняем владельца и права
+        rm -f "$tmp"
+        echo "[UPDATE] $key отключён в $file"
+        RESTART=1
+    fi
+
+    # Про Match-блоки только предупреждаем: это осознанные исключения админа
+    awk -v key="$key" -v f="$file" '
+        { if (tolower($1) == "match") inmatch = 1
+          else if (inmatch && tolower($1) == tolower(key))
+              print "[WARN] " key " задан внутри Match-блока в " f ":" NR " — оставлен без изменений" }
+    ' "$file"
+}
+
+render_conf() {
+    printf '%s\n' "$MARK_BEGIN"
+    printf '# Управляется secure_ssh.sh — ручные правки будут перезаписаны.\n'
+    local line
+    for line in "${CONF_LINES[@]}"; do
+        printf '%s\n' "$line"
+    done
+    printf '%s\n' "$MARK_END"
+}
+
+ensure_trailing_newline() {
+    local file="$1"
+    [ -s "$file" ] || return 0
+    if [ "$(tail -c1 "$file" | wc -l)" -eq 0 ]; then
+        printf '\n' >> "$file"
+        echo "[FIX] Добавлен отсутствовавший перенос строки в конец $file"
+    fi
+}
+
+snapshot_create() {
+    SNAPSHOT=$(mktemp -d)
+    cp -a "$CONFIG" "$SNAPSHOT/sshd_config"
+    if [ -n "$DROPIN_DIR" ] && [ -d "$DROPIN_DIR" ]; then
+        mkdir -p "$SNAPSHOT/dropin"
+        cp -a "$DROPIN_DIR/." "$SNAPSHOT/dropin/"
+    fi
+}
+
+snapshot_restore() {
+    cp -a "$SNAPSHOT/sshd_config" "$CONFIG"
+    # Проверка $DROPIN_DIR обязательна: при пустом значении rm ушёл бы в корень
+    if [ -n "$DROPIN_DIR" ] && [ -d "$DROPIN_DIR" ] && [ -d "$SNAPSHOT/dropin" ]; then
+        rm -f "$DROPIN_DIR"/*.conf
+        cp -a "$SNAPSHOT/dropin/." "$DROPIN_DIR/"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Загружаем и проверяем публичные ключи (до любых изменений в системе)
+# ---------------------------------------------------------------------------
+
 echo "[INFO] Загружаю публичные ключи с GitHub пользователя $GITHUB_USER..."
 if ! RAW_KEYS=$(curl -fsSL --connect-timeout 10 --max-time 20 "https://github.com/${GITHUB_USER}.keys"); then
     echo "[ERROR] Не удалось загрузить ключи с GitHub (сетевая ошибка или пользователь/ключи не найдены)"
@@ -84,78 +199,220 @@ if [ "${#VALID_KEYS[@]}" -eq 0 ]; then
     exit 1
 fi
 
-# Бэкап оригинального sshd_config (создаётся один раз за всё время)
+# ---------------------------------------------------------------------------
+# Определяем окружение: версия OpenSSH, drop-in каталог, юнит systemd
+# ---------------------------------------------------------------------------
+
+OPENSSH_VERSION="$(sshd -V 2>&1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
+if [ -z "$OPENSSH_VERSION" ]; then
+    OPENSSH_VERSION="$(ssh -V 2>&1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
+fi
+if [ -n "$OPENSSH_VERSION" ]; then
+    echo "[INFO] Обнаружен OpenSSH $OPENSSH_VERSION"
+else
+    echo "[WARN] Не удалось определить версию OpenSSH — применяю консервативные настройки"
+fi
+
+# В sshd_config выигрывает ПЕРВОЕ вхождение параметра, а Include на Debian 12 /
+# Ubuntu 22.04+ стоит в начале файла. Поэтому свои настройки кладём в drop-in,
+# который сортируется раньше остальных (00-*), а конфликты гасим отдельно.
+INCLUDE_PATH="$(awk 'tolower($1) == "include" { print $2; exit }' "$CONFIG" || true)"
+if [ -n "$INCLUDE_PATH" ]; then
+    case "$INCLUDE_PATH" in
+        /*) ;;
+        *) INCLUDE_PATH="/etc/ssh/$INCLUDE_PATH" ;;
+    esac
+    if [ "$(basename "$INCLUDE_PATH")" = "*.conf" ]; then
+        DROPIN_DIR="$(dirname "$INCLUDE_PATH")"
+        DROPIN_FILE="$DROPIN_DIR/00-secure-ssh-hardening.conf"
+        echo "[INFO] Найден Include $INCLUDE_PATH — настройки пойдут в $DROPIN_FILE"
+    else
+        echo "[WARN] Include с нестандартным шаблоном ($INCLUDE_PATH) — пишу напрямую в $CONFIG"
+    fi
+else
+    echo "[INFO] Include не найден — настройки пойдут прямо в $CONFIG"
+fi
+
+SSH_UNIT=""
+for unit in ssh.service sshd.service; do
+    if systemctl cat "$unit" >/dev/null 2>&1; then
+        if [ -z "$SSH_UNIT" ] || systemctl is-active --quiet "$unit"; then
+            SSH_UNIT="$unit"
+        fi
+    fi
+done
+if [ -z "$SSH_UNIT" ]; then
+    echo "[ERROR] Не найден systemd-юнит SSH (ни ssh.service, ни sshd.service)"
+    exit 1
+fi
+echo "[INFO] SSH-юнит: $SSH_UNIT"
+
+SOCKET_ACTIVE=0
+if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    SOCKET_ACTIVE=1
+fi
+
+# ---------------------------------------------------------------------------
+# Резервные копии
+# ---------------------------------------------------------------------------
+
+mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
+
 if [ ! -f "$ORIG_BACKUP" ]; then
-    cp "$CONFIG" "$ORIG_BACKUP"
+    cp -a "$CONFIG" "$ORIG_BACKUP"
     echo "[INFO] Исходный конфиг сохранён: $ORIG_BACKUP"
 fi
 
-# Бэкап перед текущим запуском (для автоматического отката при ошибке)
-cp "$CONFIG" "$RUN_BACKUP"
-
-# Функция для установки параметра (идемпотентно)
-set_param() {
-    local key="$1"
-    local value="$2"
-    if grep -qE "^\s*${key}\s+${value}$" "$CONFIG"; then
-        echo "[OK] ${key} уже = ${value}"
-    elif grep -qE "^\s*${key}" "$CONFIG"; then
-        sed -i "s|^\s*${key}.*|${key} ${value}|" "$CONFIG"
-        echo "[UPDATE] ${key} -> ${value}"
-        RESTART=1
-    else
-        echo "${key} ${value}" >> "$CONFIG"
-        echo "[ADD] ${key} -> ${value}"
-        RESTART=1
-    fi
-}
-
-# Функция для комментирования параметра, если он присутствует (идемпотентно)
-comment_param() {
-    local pattern="$1"
-    local desc="$2"
-    if grep -qE "^\s*${pattern}$" "$CONFIG"; then
-        sed -i -E "s|^\s*(${pattern})$|#\1|" "$CONFIG"
-        echo "[UPDATE] ${desc} закомментирован"
-        RESTART=1
-    else
-        echo "[OK] ${desc} уже закомментирован или отсутствует"
-    fi
-}
-
-# Определяем версию OpenSSH, чтобы решить, доступен ли KbdInteractiveAuthentication
-# (введён в OpenSSH 8.7 взамен устаревшего ChallengeResponseAuthentication)
-version_ge() {
-    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
-}
-OPENSSH_VERSION="$(sshd -V 2>&1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
-
-# Основные параметры безопасности
-set_param "Port" "22"
-set_param "Protocol" "2"
-set_param "PermitRootLogin" "prohibit-password"
-set_param "PasswordAuthentication" "no"
-set_param "PermitEmptyPasswords" "no"
-set_param "PubkeyAuthentication" "yes"
-set_param "ChallengeResponseAuthentication" "no"
-if [ -n "$OPENSSH_VERSION" ] && version_ge "$OPENSSH_VERSION" "8.7"; then
-    set_param "KbdInteractiveAuthentication" "no"
-else
-    echo "[INFO] OpenSSH < 8.7 или версия не определена — KbdInteractiveAuthentication не добавляется"
+rm -rf "$PRERUN_DIR"
+mkdir -p "$PRERUN_DIR"
+cp -a "$CONFIG" "$PRERUN_DIR/sshd_config"
+if [ -n "$DROPIN_DIR" ] && [ -d "$DROPIN_DIR" ]; then
+    mkdir -p "$PRERUN_DIR/sshd_config.d"
+    cp -a "$DROPIN_DIR/." "$PRERUN_DIR/sshd_config.d/"
 fi
-set_param "UsePAM" "yes"
-set_param "LoginGraceTime" "30"
-set_param "MaxAuthTries" "3"
-set_param "ClientAliveInterval" "300"
-set_param "ClientAliveCountMax" "2"
-set_param "X11Forwarding" "no"
-set_param "AllowTcpForwarding" "no"
-set_param "LogLevel" "INFO"
-set_param "Banner" "$BANNER_FILE"
+echo "[INFO] Копия конфигурации до запуска: $PRERUN_DIR"
 
-comment_param "AcceptEnv LANG LC_\*" "AcceptEnv LANG LC_*"
+snapshot_create
 
-# Устанавливаем баннер (идемпотентно)
+# ---------------------------------------------------------------------------
+# Формируем набор параметров
+# ---------------------------------------------------------------------------
+
+CONF_LINES=()
+add_param() { CONF_LINES+=("$1 $2"); }
+
+add_param "Port" "22"
+add_param "PermitRootLogin" "prohibit-password"
+add_param "PasswordAuthentication" "no"
+add_param "PermitEmptyPasswords" "no"
+add_param "PubkeyAuthentication" "yes"
+add_param "UsePAM" "yes"
+add_param "LoginGraceTime" "30"
+add_param "MaxAuthTries" "3"
+add_param "ClientAliveInterval" "300"
+add_param "ClientAliveCountMax" "2"
+add_param "X11Forwarding" "no"
+add_param "AllowTcpForwarding" "no"
+add_param "LogLevel" "INFO"
+add_param "Banner" "$BANNER_FILE"
+
+# KbdInteractiveAuthentication появился в OpenSSH 8.7 взамен
+# устаревшего ChallengeResponseAuthentication
+if [ -n "$OPENSSH_VERSION" ] && version_ge "$OPENSSH_VERSION" "8.7"; then
+    add_param "KbdInteractiveAuthentication" "no"
+else
+    add_param "ChallengeResponseAuthentication" "no"
+fi
+
+# Современная криптография (имена алгоритмов доступны начиная с OpenSSH 7.4)
+if [ -n "$OPENSSH_VERSION" ] && version_ge "$OPENSSH_VERSION" "7.4"; then
+    add_param "KexAlgorithms" "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group-exchange-sha256"
+    add_param "Ciphers" "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr"
+    add_param "MACs" "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com"
+    # HostKeyAlgorithms сужаем только если у сервера есть подходящий ключ,
+    # иначе sshd останется вообще без host key
+    if [ -f /etc/ssh/ssh_host_ed25519_key ] || [ -f /etc/ssh/ssh_host_rsa_key ]; then
+        add_param "HostKeyAlgorithms" "ssh-ed25519,ssh-ed25519-cert-v01@openssh.com,rsa-sha2-512,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256,rsa-sha2-256-cert-v01@openssh.com"
+    else
+        echo "[WARN] Не найдены ed25519/RSA host key — HostKeyAlgorithms не сужается"
+    fi
+else
+    echo "[INFO] OpenSSH < 7.4 или версия не определена — криптонастройки пропущены"
+fi
+
+if [ -n "$SSH_ALLOW_USERS" ]; then
+    add_param "AllowUsers" "$SSH_ALLOW_USERS"
+    echo "[INFO] Доступ ограничен пользователями: $SSH_ALLOW_USERS"
+fi
+if [ -n "$SSH_ALLOW_GROUPS" ]; then
+    add_param "AllowGroups" "$SSH_ALLOW_GROUPS"
+    echo "[INFO] Доступ ограничен группами: $SSH_ALLOW_GROUPS"
+fi
+
+MANAGED_KEYS=()
+for line in "${CONF_LINES[@]}"; do
+    MANAGED_KEYS+=("${line%% *}")
+done
+
+# ---------------------------------------------------------------------------
+# Гасим конфликтующие директивы везде, кроме нашего блока
+# ---------------------------------------------------------------------------
+
+CONFLICT_FILES=("$CONFIG")
+if [ -n "$DROPIN_DIR" ] && [ -d "$DROPIN_DIR" ]; then
+    for f in "$DROPIN_DIR"/*.conf; do
+        [ -f "$f" ] || continue
+        [ "$f" = "$DROPIN_FILE" ] && continue
+        CONFLICT_FILES+=("$f")
+    done
+fi
+
+for f in "${CONFLICT_FILES[@]}"; do
+    for key in "${MANAGED_KEYS[@]}"; do
+        comment_key "$f" "$key"
+    done
+    comment_key "$f" "AcceptEnv"
+    # Protocol удалён из OpenSSH 7.4 — просто мусор в конфиге
+    if [ -n "$OPENSSH_VERSION" ] && version_ge "$OPENSSH_VERSION" "7.4"; then
+        comment_key "$f" "Protocol"
+    fi
+    # На новых версиях ChallengeResponseAuthentication заменён на KbdInteractive
+    if [ -n "$OPENSSH_VERSION" ] && version_ge "$OPENSSH_VERSION" "8.7"; then
+        comment_key "$f" "ChallengeResponseAuthentication"
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# Записываем управляемый блок
+# ---------------------------------------------------------------------------
+
+if [ -n "$DROPIN_FILE" ]; then
+    mkdir -p "$DROPIN_DIR"
+    chmod 755 "$DROPIN_DIR"
+    NEW_CONF=$(mktemp)
+    render_conf > "$NEW_CONF"
+    if [ -f "$DROPIN_FILE" ] && cmp -s "$NEW_CONF" "$DROPIN_FILE"; then
+        echo "[OK] $DROPIN_FILE уже актуален"
+    else
+        cat "$NEW_CONF" > "$DROPIN_FILE"
+        echo "[UPDATE] Настройки записаны в $DROPIN_FILE"
+        RESTART=1
+    fi
+    rm -f "$NEW_CONF"
+    chown root:root "$DROPIN_FILE"
+    chmod 600 "$DROPIN_FILE"
+else
+    # Без Include пишем блок в основной конфиг — обязательно ДО первого Match,
+    # иначе параметры попадут внутрь условного блока
+    BLOCK=$(render_conf)
+    TMP_A=$(mktemp)
+    TMP_B=$(mktemp)
+    awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+        $0 == b { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip   { print }
+    ' "$CONFIG" > "$TMP_A"
+    awk -v block="$BLOCK" '
+        BEGIN { inserted = 0 }
+        tolower($1) == "match" && !inserted { print block; inserted = 1 }
+        { print }
+        END { if (!inserted) print block }
+    ' "$TMP_A" > "$TMP_B"
+    if cmp -s "$TMP_B" "$CONFIG"; then
+        echo "[OK] $CONFIG уже актуален"
+    else
+        cat "$TMP_B" > "$CONFIG"
+        echo "[UPDATE] Настройки записаны в $CONFIG"
+        RESTART=1
+    fi
+    rm -f "$TMP_A" "$TMP_B"
+fi
+
+# ---------------------------------------------------------------------------
+# Баннер
+# ---------------------------------------------------------------------------
+
 if [ -f "$BANNER_FILE" ] && cmp -s <(echo "$BANNER_TEXT") "$BANNER_FILE"; then
     echo "[OK] Баннер уже установлен и совпадает"
 else
@@ -164,28 +421,35 @@ else
     RESTART=1
 fi
 
-# Приводим права и владельца sshd_config к безопасным значениям
+# ---------------------------------------------------------------------------
+# Права и проверка синтаксиса
+# ---------------------------------------------------------------------------
+
 chown root:root "$CONFIG"
 chmod 600 "$CONFIG"
 
-# Проверяем синтаксис конфига перед перезапуском; при ошибке — откат
 if ! sshd -t -f "$CONFIG"; then
-    echo "[ERROR] Проверка sshd -t не пройдена, откатываю конфиг из $RUN_BACKUP"
-    cp "$RUN_BACKUP" "$CONFIG"
+    echo "[ERROR] Проверка sshd -t не пройдена, откатываю конфигурацию"
+    snapshot_restore
     exit 1
 fi
 
-# Добавляем публичные ключи (идемпотентно)
+# ---------------------------------------------------------------------------
+# Публичные ключи
+# ---------------------------------------------------------------------------
+
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 touch "$AUTH_KEYS"
 chmod 600 "$AUTH_KEYS"
+ensure_trailing_newline "$AUTH_KEYS"
 
 for key in "${VALID_KEYS[@]}"; do
-    if grep -qF "$key" "$AUTH_KEYS"; then
+    blob=$(awk '{print $2}' <<< "$key")
+    if awk -v blob="$blob" '$2 == blob { found = 1 } END { exit !found }' "$AUTH_KEYS"; then
         echo "[OK] Ключ уже есть в $AUTH_KEYS"
     else
-        echo "$key" >> "$AUTH_KEYS"
+        printf '%s\n' "$key" >> "$AUTH_KEYS"
         echo "[ADD] Новый ключ добавлен в $AUTH_KEYS"
     fi
 done
@@ -201,10 +465,37 @@ if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" != "Disabled" ]; t
     fi
 fi
 
-# Перезапуск SSH только если были изменения
-if [ "$RESTART" == "1" ]; then
-    echo "[INFO] Были изменения. Перезапускаю SSH..."
-    systemctl restart sshd && echo "[OK] SSH перезапущен" || echo "[ERROR] Не удалось перезапустить SSH"
+# ---------------------------------------------------------------------------
+# Применяем конфигурацию
+# ---------------------------------------------------------------------------
+
+if [ "$RESTART" -ne 1 ]; then
+    echo "[INFO] Изменений нет, перезагрузка не требуется"
+    exit 0
+fi
+
+echo "[INFO] Были изменения, применяю конфигурацию..."
+
+if [ "$SOCKET_ACTIVE" -eq 1 ]; then
+    echo "[WARN] SSH работает через ssh.socket — порт задаётся в сокет-юните,"
+    echo "[WARN] параметр Port из sshd_config игнорируется"
+    if ! systemctl restart ssh.socket; then
+        echo "[ERROR] Не удалось перезапустить ssh.socket"
+        exit 1
+    fi
+    echo "[OK] ssh.socket перезапущен"
+fi
+
+if systemctl is-active --quiet "$SSH_UNIT"; then
+    # reload (SIGHUP) не рвёт существующие сессии, в отличие от restart
+    if systemctl reload "$SSH_UNIT" 2>/dev/null; then
+        echo "[OK] $SSH_UNIT перечитал конфигурацию"
+    elif systemctl restart "$SSH_UNIT"; then
+        echo "[OK] $SSH_UNIT перезапущен"
+    else
+        echo "[ERROR] Не удалось применить конфигурацию в $SSH_UNIT"
+        exit 1
+    fi
 else
-    echo "[INFO] Изменений нет, перезапуск не требуется"
+    echo "[INFO] $SSH_UNIT не запущен — применять нечего"
 fi
