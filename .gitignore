@@ -25,12 +25,3 @@ __pycache__/
 *.tfstate
 *.tfstate.*
 .terraform/
-*.bak
-*.old
-*.orig
-*.log
-*.swp
-*.swo
-*~
-.vscode/
-.idea/
