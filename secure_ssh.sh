@@ -54,6 +54,7 @@ NO_RELOAD="${NO_RELOAD:-no}"
 RELOAD_METHOD="${RELOAD_METHOD:-auto}"           # auto | systemd | openrc | service | sighup
 OPEN_FIREWALL="${OPEN_FIREWALL:-no}"
 PRUNE_KEYS="${PRUNE_KEYS:-no}"
+UNRESTRICT_KEYS="${UNRESTRICT_KEYS:-no}"         # добавлять обычную строку, если ключ есть только с from=/command=
 FORCE="${FORCE:-no}"
 YES="${YES:-no}"
 QUIET="${QUIET:-no}"
@@ -84,6 +85,7 @@ secure_ssh.sh v$VERSION — безопасная настройка sshd + кл�
       --keys-file ФАЙЛ      брать ключи из локального файла (KEYS_FILE)
       --users U1,U2         кому класть ключи (TARGET_USERS; по умолчанию root + SUDO_USER/DOAS_USER)
       --prune               удалить ключи с меткой github:USER, которых больше нет в списке (PRUNE_KEYS)
+      --unrestrict          если ключ уже есть с ограничениями (from=/command=), добавить строку без них (UNRESTRICT_KEYS)
 
 Настройки sshd (значения запоминаются в STATE_FILE и действуют при следующих запусках):
   -p, --port N              порт sshd (SSH_PORT; по умолчанию порт НЕ меняется)
@@ -125,7 +127,7 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
     C_INFO="$(printf '\033[36m')"; C_OK="$(printf '\033[32m')"; C_WARN="$(printf '\033[33m')"
     C_ERR="$(printf '\033[31m')"; C_CHG="$(printf '\033[35m')"; C_OFF="$(printf '\033[0m')"
 fi
-say()    { printf '%s\n' "$*"; }
+say()    { printf '%s\n' "$*" 2>/dev/null || :; }   # терминал может быть уже мёртв (EIO/EPIPE)
 info()   { [ "$QUIET" = yes ] || say "${C_INFO}[INFO]${C_OFF} $*"; }
 ok()     { [ "$QUIET" = yes ] || say "${C_OK}[OK]${C_OFF} $*"; }
 note()   { say "${C_INFO}[INFO]${C_OFF} $*"; }           # печатается и в --quiet
@@ -149,6 +151,7 @@ parse_args() {
             --keys-file)         need_arg "$@"; KEYS_FILE="$2"; shift 2 ;;
             --users)             need_arg "$@"; TARGET_USERS="$2"; shift 2 ;;
             --prune)             PRUNE_KEYS=yes; shift ;;
+            --unrestrict)        UNRESTRICT_KEYS=yes; shift ;;
             -p|--port)           need_arg "$@"; SSH_PORT="$2"; shift 2 ;;
             --close-old-port)    KEEP_OLD_PORT=no; shift ;;
             --open-firewall)     OPEN_FIREWALL=yes; shift ;;
@@ -197,7 +200,7 @@ is_port()   { is_uint "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 # порт и прочие настройки к значениям по умолчанию.
 ST_PORTS=""; ST_PERMIT_ROOT_LOGIN=""; ST_ALLOW_TCP_FORWARDING=""; ST_X11_FORWARDING=""
 ST_MAX_AUTH_TRIES=""; ST_LOGIN_GRACE_TIME=""; ST_CLIENT_ALIVE_INTERVAL=""; ST_CLIENT_ALIVE_COUNT_MAX=""
-ST_LOG_LEVEL=""; ST_MODE=""
+ST_LOG_LEVEL=""; ST_MODE=""; ST_RELOAD_PENDING=""
 load_state() {
     [ -f "$STATE_FILE" ] || return 0
     while IFS='=' read -r k v || [ -n "$k" ]; do
@@ -214,6 +217,7 @@ load_state() {
             CLIENT_ALIVE_COUNT_MAX) ST_CLIENT_ALIVE_COUNT_MAX="$v" ;;
             LOG_LEVEL)              ST_LOG_LEVEL="$v" ;;
             MODE)                   ST_MODE="$v" ;;
+            RELOAD_PENDING)         ST_RELOAD_PENDING="$v" ;;
         esac
     done < "$STATE_FILE"
 }
@@ -238,7 +242,8 @@ validate_params() {
     is_yes_no "$DISABLE_ACCEPT_ENV"   || die "DISABLE_ACCEPT_ENV: ожидается yes|no"
     is_yes_no "$BANNER"               || die "BANNER: ожидается yes|no"
     is_yes_no "$KEEP_OLD_PORT"        || die "KEEP_OLD_PORT: ожидается yes|no"
-    for v in OPEN_FIREWALL PRUNE_KEYS FORCE YES QUIET DRY_RUN NO_RELOAD RESET_STATE; do
+    UNRESTRICT_KEYS=$(norm_yn "$UNRESTRICT_KEYS")
+    for v in OPEN_FIREWALL PRUNE_KEYS UNRESTRICT_KEYS FORCE YES QUIET DRY_RUN NO_RELOAD RESET_STATE; do
         eval "x=\${$v}"; is_yes_no "$x" || die "$v: ожидается yes|no"
     done
     is_uint "$MAX_AUTH_TRIES"         || die "--max-auth-tries: ожидается число"
@@ -324,9 +329,9 @@ eff_value()  { eff_values "$1" "$2" | head -n 1; }
 
 # ---------- Предварительные проверки и окружение ----------
 TMPDIR_=""; LOCK_DIR=""
-APPLY_STARTED=0; APPLY_OK=0; ROLLED_BACK=0
+APPLY_STARTED=0; APPLY_OK=0; ROLLED_BACK=0; CONFIRM_PENDING=0; RPID=""; WD_PID=""; NO_ORIG=0
 RUN_BACKUP=""; DROPIN_SAVED=""; DROPIN_PATH=""; BANNER_SAVED=""; STATE_SAVED=""; NEED_RELOAD=0
-SERVICE_WAS_UP=0; RELOAD_DONE=""; RELOAD_UNIT=""
+SERVICE_WAS_UP=0; RELOAD_DONE=""; RELOAD_UNIT=""; RELOAD_FAILED=0
 
 restore_file() {  # restore_file БЭКАП ЦЕЛЬ -> восстановить атомарно; пустой бэкап не используем
     if [ ! -s "$1" ]; then warn "бэкап $1 пуст или отсутствует, $2 не восстанавливаю"; return 1; fi
@@ -359,11 +364,21 @@ rollback() {
 # shellcheck disable=SC2317  # вызывается из trap
 cleanup() {
     rc=$?
-    if [ "$rc" -ne 0 ] && [ "$APPLY_STARTED" = 1 ] && [ "$APPLY_OK" = 0 ]; then
+    set +e
+    if [ -n "$RPID" ]; then kill "$RPID" 2>/dev/null; fi
+    if [ "$CONFIRM_PENDING" = 1 ]; then
+        # Сигнал (обрыв сессии, Ctrl-C) во время ожидания подтверждения: считаем, что подтверждения нет
+        warn "ожидание подтверждения прервано (сигнал), откатываю"
+        APPLY_OK=1; rollback
+        : > "$CONFIRM_FILE.done" 2>/dev/null
+        rc=3
+    elif [ "$rc" -ne 0 ] && [ "$APPLY_STARTED" = 1 ] && [ "$APPLY_OK" = 0 ]; then
         rollback
     fi
+    if [ -n "$WD_PID" ]; then kill "$WD_PID" 2>/dev/null; fi
     [ -n "$LOCK_DIR" ] && rm -rf "$LOCK_DIR"
     [ -n "$TMPDIR_" ] && rm -rf "$TMPDIR_"
+    [ "$rc" = 3 ] && exit 3
     return 0
 }
 
@@ -377,6 +392,8 @@ preflight() {
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    trap 'exit 141' PIPE
 
     # Защита от параллельного запуска
     LOCK_DIR="$CFG_DIR/.secure_ssh.lock"
@@ -591,11 +608,15 @@ reload_sshd() {  # $1 = reload|restart
     mode="${1:-reload}"
     strats="reload_systemd reload_openrc reload_service reload_sighup"
     [ "$RELOAD_METHOD" = auto ] || strats="reload_$RELOAD_METHOD"
+    tried=0
     for strat in $strats; do
         "$strat" "$mode"; rc=$?
-        case "$rc" in 0) RELOAD_DONE=1; return 0 ;; 1) return 1 ;; esac
+        case "$rc" in
+            0) RELOAD_DONE=1; return 0 ;;
+            1) tried=1; RELOAD_DONE=1 ;;   # служба уже тронута (reload/restart пытались) — пробуем следующий способ
+        esac
     done
-    warn "не удалось определить способ перезапуска sshd (systemd/OpenRC/service/pid-файл)"
+    [ "$tried" = 1 ] || warn "не удалось определить способ перезапуска sshd (systemd/OpenRC/service/pid-файл)"
     return 1
 }
 
@@ -687,7 +708,27 @@ resolve_users() {
 }
 
 # ---------- authorized_keys: путь, безопасная запись, дедупликация ----------
-# Первый файл из эффективного AuthorizedKeysFile для пользователя $1 с домом $2
+# Раскрыть токены sshd (%h, %u, %U, %%) в строке $1 для дома $2, пользователя $3, uid $4
+expand_tokens() {
+    str="$1"; out=""
+    while :; do
+        case "$str" in
+            *%*)
+                out="$out${str%%\%*}"; rest=${str#*%}
+                case "$rest" in
+                    h*) out="$out$2"; str=${rest#h} ;;
+                    u*) out="$out$3"; str=${rest#u} ;;
+                    U*) out="$out$4"; str=${rest#U} ;;
+                    %*) out="$out%";  str=${rest#%} ;;
+                    *)  return 1 ;;
+                esac ;;
+            *) out="$out$str"; break ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+# Первый файл из эффективного AuthorizedKeysFile для пользователя $1 с домом $2 и uid $3.
+# Побочный эффект: $TMPDIR_/eff.user — вывод sshd -T -C для этого пользователя
 akf_for_user() {
     f=""
     if sshd_T "$SSHD_CONFIG" "$1" > "$TMPDIR_/eff.user" 2>/dev/null || sshd_T "$SSHD_CONFIG" > "$TMPDIR_/eff.user" 2>/dev/null; then
@@ -695,18 +736,47 @@ akf_for_user() {
     fi
     [ -n "$f" ] || f=".ssh/authorized_keys"
     [ "$f" = none ] && { printf 'none'; return 0; }
-    f=$(printf '%s' "$f" | H="$2" U="$1" awk '{ gsub(/%h/, ENVIRON["H"]); gsub(/%u/, ENVIRON["U"]); gsub(/%%/, "%"); print }')
+    f=$(expand_tokens "$f" "$2" "$1" "$3") || die "$1: AuthorizedKeysFile '$f' содержит неподдерживаемый токен"
     case "$f" in /*) ;; *) f="$2/$f" ;; esac
     printf '%s' "$f"
 }
-# Состояние ключа (тип $1, blob $2) в файле $3: active | inactive | absent
+# Состояние ключа (тип $1, blob $2) в файле $3: active | restricted (с опциями from=/command=) | commented | absent
 key_state() {
     [ -f "$3" ] || { printf 'absent'; return 0; }
     grep -qF -- "$2" "$3" || { printf 'absent'; return 0; }
-    if T="$1" B="$2" awk '
-        /^[ \t]*(#|$)/ { next }
-        { for (i = 1; i < NF; i++) if ($i == ENVIRON["T"] && $(i+1) == ENVIRON["B"]) { if (i == 1) a = 1; else o = 1 } }
-        END { exit !(a) }' "$3"; then printf 'active'; else printf 'inactive'; fi
+    T="$1" B="$2" awk '
+        /^[ \t]*(#|$)/ { if (index($0, ENVIRON["B"])) c = 1; next }
+        { for (i = 1; i < NF; i++) if ($i == ENVIRON["T"] && $(i+1) == ENVIRON["B"]) { if (i == 1) a = 1; else r = 1 } }
+        END { if (a) print "active"; else if (r) print "restricted"; else if (c) print "commented"; else print "absent" }' "$3"
+}
+# Принимает ли sshd ключ типа $1 (по pubkeyacceptedalgorithms / pubkeyacceptedkeytypes из $2)
+key_type_accepted() {
+    algs=$(eff_value "$2" pubkeyacceptedalgorithms); [ -n "$algs" ] || algs=$(eff_value "$2" pubkeyacceptedkeytypes)
+    [ -n "$algs" ] || return 0   # старый sshd без такой директивы в -T: принимает всё, что знает
+    case ",$algs," in
+        *",$1,"*) return 0 ;;
+    esac
+    case "$1" in ssh-rsa) case ",$algs," in *",rsa-sha2-256,"*|*",rsa-sha2-512,"*) return 0 ;; esac ;; esac
+    return 1
+}
+# Разрешён ли вход пользователю $1 по AllowUsers/AllowGroups/DenyUsers/DenyGroups из $2 (sshd -T -C user=...)
+# shellcheck disable=SC2254  # шаблон намеренно раскрывается как glob (AllowUsers user*, *@host)
+glob_match() { case "$1" in $2) return 0 ;; *) return 1 ;; esac; }
+user_allowed() {
+    u="$1"; e="$2"; groups_=$(id -Gn "$u" 2>/dev/null || true)
+    for pat in $(eff_values "$e" denyusers); do glob_match "$u" "${pat%%@*}" && [ "${pat#*@}" = "$pat" ] && { ALLOW_REASON="DenyUsers $pat"; return 1; }; done
+    for pat in $(eff_values "$e" denygroups); do for g in $groups_; do glob_match "$g" "$pat" && { ALLOW_REASON="DenyGroups $pat"; return 1; }; done; done
+    allow=$(eff_values "$e" allowusers | tr '\n' ' ')
+    if [ -n "$allow" ]; then
+        okk=0; for pat in $allow; do glob_match "$u" "${pat%%@*}" && okk=1; done
+        [ "$okk" = 1 ] || { ALLOW_REASON="нет в AllowUsers ($allow)"; return 1; }
+    fi
+    allow=$(eff_values "$e" allowgroups | tr '\n' ' ')
+    if [ -n "$allow" ]; then
+        okk=0; for pat in $allow; do for g in $groups_; do glob_match "$g" "$pat" && okk=1; done; done
+        [ "$okk" = 1 ] || { ALLOW_REASON="группы ($groups_) нет в AllowGroups ($allow)"; return 1; }
+    fi
+    return 0
 }
 # Проверка, что путь $1 не симлинк и принадлежит uid $2 или root
 assert_safe_path() {
@@ -715,30 +785,47 @@ assert_safe_path() {
     own=$(file_uid "$1")
     if [ "$own" != "$2" ] && [ "$own" != 0 ]; then die "$1 принадлежит uid $own, а не пользователю (uid $2) и не root"; fi
 }
-LOGIN_MATRIX=""
+LOGIN_MATRIX=""; LOGIN_OK_USERS=0; ALLOW_REASON=""
 install_keys_for_user() {
     u="$1"; h=$(user_home "$u"); uid=$(user_uid "$u"); grp=$(id -gn "$u")
-    ak=$(akf_for_user "$u" "$h")
+    ak=$(akf_for_user "$u" "$h" "$uid")
     if [ "$ak" = none ]; then
         msg="$u: AuthorizedKeysFile none — sshd не читает файлы ключей (только AuthorizedKeysCommand)"
         if [ "$FORCE" = yes ]; then warn "$msg"; return 0; else die "$msg. Отключать пароли опасно (--force, чтобы продолжить)"; fi
+    fi
+    can_login=1
+    if ! user_allowed "$u" "$TMPDIR_/eff.user"; then
+        warn "$u: sshd не пустит этого пользователя: $ALLOW_REASON. Ключ поставлю, но входа не будет"
+        can_login=0
     fi
     akdir=$(dirname "$ak")
     case "$ak" in
         "$h"/*) in_home=1 ;;
         *) in_home=0; info "$u: AuthorizedKeysFile = $ak (вне домашнего каталога)" ;;
     esac
-    # StrictModes: домашний каталог и .ssh не должны быть доступны на запись группе/остальным
+    # StrictModes: домашний каталог и каталог ключей не должны быть доступны на запись группе/остальным
     for d in "$h" "$akdir"; do
         [ -d "$d" ] || continue
         m=$(file_mode "$d")
         case "$m" in ?[2367]?|??[2367]) warn "$u: $d имеет права $m (запись для группы/остальных) — при StrictModes yes sshd не примет ключ. Исправьте: chmod go-w $d" ;; esac
     done
-    added=0; present=0; inactive=0; add_list=""
+    added=0; present=0; restricted=0; unusable=0; add_list=""
     while read -r ktype kblob _rest; do
+        if ! key_type_accepted "$ktype" "$TMPDIR_/eff.user"; then
+            unusable=$((unusable + 1))
+            warn "$u: ключ типа $ktype не входит в PubkeyAcceptedAlgorithms этого sshd — вход с ним невозможен"
+        fi
         case "$(key_state "$ktype" "$kblob" "$ak")" in
             active) present=$((present + 1)); continue ;;
-            inactive) inactive=$((inactive + 1)); warn "$u: ключ $(printf '%.12s' "$kblob")... есть в $ak, но закомментирован или с ограничениями (command=/from=...) — добавлю обычную строку" ;;
+            restricted)
+                if [ "$UNRESTRICT_KEYS" = yes ]; then
+                    warn "$u: ключ $(printf '%.12s' "$kblob")... есть в $ak с ограничениями (from=/command=); по --unrestrict добавляю строку без ограничений"
+                else
+                    restricted=$((restricted + 1))
+                    warn "$u: ключ $(printf '%.12s' "$kblob")... есть в $ak только с ограничениями (from=/command=/restrict) — оставляю как есть; снять: --unrestrict"
+                    continue
+                fi ;;
+            commented) warn "$u: ключ $(printf '%.12s' "$kblob")... закомментирован в $ak — добавлю активную строку" ;;
         esac
         added=$((added + 1)); add_list="$add_list$ktype $kblob github:$GITHUB_USER
 "
@@ -750,40 +837,54 @@ install_keys_for_user() {
     if [ "$added" -gt 0 ] || [ "$pruned" -gt 0 ]; then
         change ADD "$u: добавить ключей в $ak: $added (уже есть: $present${pruned:+, удалить устаревших github:$GITHUB_USER: $pruned})"
     else
-        ok "$u: все $present ключ(ей) уже в $ak"
+        ok "$u: все $((present + restricted)) ключ(ей) уже в $ak"
     fi
-    if [ "$DRY_RUN" != yes ] && [ "$ACTION" = apply ]; then
+    if [ "$DRY_RUN" != yes ] && [ "$ACTION" = apply ] && { [ "$added" -gt 0 ] || [ "$pruned" -gt 0 ] || [ ! -f "$ak" ]; }; then
         assert_safe_path "$akdir" "$uid"; assert_safe_path "$ak" "$uid"
         if [ ! -d "$akdir" ]; then
-            mkdir -p "$akdir" || die "не удалось создать $akdir"
+            parent=$(dirname "$akdir")
+            [ -d "$parent" ] || mkdir -p "$parent" || die "не удалось создать $parent"
+            mkdir "$akdir" || die "не удалось создать $akdir"   # без -p: по симлинку mkdir не пройдёт
             if [ "$in_home" = 1 ]; then chmod 700 "$akdir" && chown -h "$uid:$grp" "$akdir"; else chmod 755 "$akdir"; fi
         fi
         [ -e "$ak" ] && [ ! -f "$ak" ] && die "$ak не обычный файл"
-        if [ ! -f "$ak" ]; then
-            : > "$ak" || die "не удалось создать $ak"
-        fi
-        if [ "$added" -gt 0 ] || [ "$pruned" -gt 0 ]; then
-            cp -p "$ak" "$TMPDIR_/ak.new" || die "не удалось прочитать $ak"
+        # Новый файл собирается в каталоге назначения через mktemp (O_EXCL, случайное имя, 600 root),
+        # затем атомарно переименовывается поверх $ak: симлинки на месте $ak при rename не разыменовываются.
+        newak=$(mktemp "$akdir/.authorized_keys.XXXXXX") || die "не удалось создать временный файл в $akdir"
+        if [ -f "$ak" ]; then
+            [ -L "$ak" ] && die "$ak стал символической ссылкой"
             if [ "$pruned" -gt 0 ]; then
-                L="github:$GITHUB_USER" awk 'FNR == NR { b[$2] = 1; next } $NF == ENVIRON["L"] && !($2 in b) { next } { print }' "$VALID_KEYS" "$ak" > "$TMPDIR_/ak.new" || die "ошибка при очистке $ak"
+                L="github:$GITHUB_USER" awk 'FNR == NR { b[$2] = 1; next } $NF == ENVIRON["L"] && !($2 in b) { next } { print }' "$VALID_KEYS" "$ak" > "$newak" || { rm -f "$newak"; die "ошибка при очистке $ak"; }
+            else
+                cat "$ak" > "$newak" || { rm -f "$newak"; die "не удалось прочитать $ak"; }
             fi
-            if [ -s "$TMPDIR_/ak.new" ] && [ -n "$(tail -c 1 "$TMPDIR_/ak.new")" ]; then printf '\n' >> "$TMPDIR_/ak.new"; fi
-            printf '%s' "$add_list" >> "$TMPDIR_/ak.new"
-            cp -p "$ak" "$ak.secure_ssh.tmp" && cat "$TMPDIR_/ak.new" > "$ak.secure_ssh.tmp" && mv -f "$ak.secure_ssh.tmp" "$ak" \
-                || { rm -f "$ak.secure_ssh.tmp"; die "не удалось записать $ak"; }
         fi
-        if [ "$in_home" = 1 ]; then
-            chmod 700 "$akdir"; chmod 600 "$ak"; chown -h "$uid:$grp" "$akdir" "$ak"
-        else
-            chmod 644 "$ak"
+        if [ -s "$newak" ] && [ -n "$(tail -c 1 "$newak")" ]; then printf '\n' >> "$newak"; fi
+        printf '%s' "$add_list" >> "$newak" || { rm -f "$newak"; die "не удалось записать $newak"; }
+        if [ "$in_home" = 1 ]; then chmod 600 "$newak" && chown -h "$uid:$grp" "$newak"; else chmod 644 "$newak"; fi
+        mv -f "$newak" "$ak" || { rm -f "$newak"; die "не удалось заменить $ak"; }
+        # права каталога: только для созданного нами ~/.ssh; домашний каталог (AuthorizedKeysFile %h/...) не трогаем
+        if [ "$in_home" = 1 ] && [ "$akdir" != "$h" ] && [ "$(file_mode "$akdir")" != 700 ]; then
+            chmod 700 "$akdir" 2>/dev/null || true
         fi
         if have restorecon; then restorecon -R "$akdir" 2>/dev/null || true; fi
     fi
     total=$((present + added))
+    usable=$((N_KEYS - unusable))
     case "$u:$PERMIT_ROOT_LOGIN" in
         root:no|root:forced-commands-only) LOGIN_MATRIX="$LOGIN_MATRIX, root (нет: PermitRootLogin $PERMIT_ROOT_LOGIN)" ;;
-        *) LOGIN_MATRIX="$LOGIN_MATRIX, $u ($total ключ.)" ;;
+        *)
+            if [ "$can_login" = 0 ]; then LOGIN_MATRIX="$LOGIN_MATRIX, $u (нет: $ALLOW_REASON)"
+            elif [ "$total" -eq 0 ] && [ "$restricted" -gt 0 ]; then LOGIN_MATRIX="$LOGIN_MATRIX, $u (только ключи с ограничениями)"
+            elif [ "$usable" -le 0 ]; then LOGIN_MATRIX="$LOGIN_MATRIX, $u (нет: тип ключей не принимается sshd)"
+            else LOGIN_MATRIX="$LOGIN_MATRIX, $u ($total ключ.)"; LOGIN_OK_USERS=$((LOGIN_OK_USERS + 1)); fi ;;
     esac
+}
+# После установки ключей: должен остаться хотя бы один пользователь, который реально сможет войти
+assert_login_possible() {
+    [ "$LOGIN_OK_USERS" -gt 0 ] && return 0
+    msg="после отключения паролей войти по ключу не сможет никто (${LOGIN_MATRIX#, }). Проверьте AllowUsers/AllowGroups, PubkeyAcceptedAlgorithms, ограничения from=/command= (--unrestrict)"
+    if [ "$FORCE" = yes ]; then warn "$msg (продолжаю из-за --force)"; else die "$msg (или --force)"; fi
 }
 
 # ---------- Порты: план и предварительные проверки ----------
@@ -806,12 +907,20 @@ explicit_listen_ports() {
           if (v !~ /\[/ && gsub(/:/, ":", v) == 1) { sub(/.*:/, "", v); print v }
       }' 2>/dev/null | sort -u | tr '\n' ' '
 }
-plan_ports() {
+# Порты из вывода sshd -T ($1): строки port и явные порты в listenaddress (host:port, [v6]:port)
+eff_ports() {
+    { eff_values "$1" port
+      eff_values "$1" listenaddress | awk '{ v = $1; if (v ~ /\]:[0-9]+$/ || (v !~ /\[/ && gsub(/:/, ":", v) == 1)) { sub(/.*:/, "", v); print v } }'
+    } | awk '!seen[$0]++' | tr '\n' ' '
+}
+# Только вычисления: какие порты сейчас, какие нужны, слушает ли их кто-то. Ничего не меняет и не спрашивает.
+compute_ports() {
     sshd_T "$SSHD_CONFIG" > "$TMPDIR_/eff.orig" || die "sshd -T не отработал на исходной конфигурации"
-    CUR_PORTS=$(eff_values "$TMPDIR_/eff.orig" port | awk '!seen[$0]++' | tr '\n' ' ')
-    CUR_PORTS=${CUR_PORTS% }
+    CUR_PORTS=$(eff_ports "$TMPDIR_/eff.orig"); CUR_PORTS=${CUR_PORTS% }
     SERVICE_WAS_UP=0
     for p in $CUR_PORTS; do port_listening "$p" && SERVICE_WAS_UP=1; done
+    [ "$SERVICE_WAS_UP" = 1 ] || warn "сейчас никто не слушает порты sshd ($CUR_PORTS): sshd не запущен? Проверить живость после перезагрузки не смогу"
+    MANAGE_PORTS=0; WANT_PORTS=""; PORTS_CHANGED=0
     if [ -n "$SSH_PORT" ]; then
         MANAGE_PORTS=1; WANT_PORTS="$SSH_PORT"
         if [ "$KEEP_OLD_PORT" = yes ]; then
@@ -831,8 +940,10 @@ plan_ports() {
     NEW_PORTS=""
     for p in $WANT_PORTS; do in_list "$p" "$CUR_PORTS" || NEW_PORTS="$NEW_PORTS $p"; done
     NEW_PORTS=${NEW_PORTS# }
+}
+# Предварительные проверки смены порта: занятость, ListenAddress, SELinux, firewall, подтверждение
+preflight_ports() {
     [ "$PORTS_CHANGED" = 1 ] || { [ "$MANAGE_PORTS" = 1 ] && ok "порты sshd: $WANT_PORTS (без изменений)"; return 0; }
-
     note "порты sshd: $CUR_PORTS -> $WANT_PORTS"
     lp=$(explicit_listen_ports)
     if [ -n "$lp" ]; then
@@ -847,9 +958,9 @@ plan_ports() {
     if [ "$KEEP_OLD_PORT" = yes ] && [ -n "$SSH_PORT" ] && [ "$WANT_PORTS" != "$SSH_PORT" ]; then
         note "старый порт остаётся открытым, пока вы не проверите вход по новому. Закрыть: --port $SSH_PORT --close-old-port"
     fi
-    [ "$SERVICE_WAS_UP" = 1 ] || warn "sshd сейчас не слушает ни один из текущих портов ($CUR_PORTS): проверить живость после перезагрузки не смогу"
     confirm_prompt "Сменить порты sshd на '$WANT_PORTS'? Убедитесь, что порт открыт в firewall и security group облака."
 }
+plan_ports() { compute_ports; preflight_ports; }
 confirm_prompt() {
     [ "$YES" = yes ] && return 0
     [ "$DRY_RUN" = yes ] && return 0
@@ -1055,7 +1166,7 @@ validate_candidate() {
 # ---------- Запись файлов: бэкапы, атомарность ----------
 backup_main() {
     [ -n "$RUN_BACKUP" ] && return 0
-    if [ ! -f "$SSHD_CONFIG.orig" ]; then
+    if [ ! -f "$SSHD_CONFIG.orig" ] && [ "$NO_ORIG" = 0 ]; then
         cp -p "$SSHD_CONFIG" "$SSHD_CONFIG.orig" && cmp -s "$SSHD_CONFIG" "$SSHD_CONFIG.orig" \
             || { rm -f "$SSHD_CONFIG.orig"; die "не удалось сохранить первоначальную копию $SSHD_CONFIG.orig (нет места?)"; }
         info "первоначальная копия сохранена: $SSHD_CONFIG.orig"
@@ -1160,11 +1271,21 @@ apply_config() {
 }
 do_reload() {
     [ "$DRY_RUN" = yes ] && return 0
+    if [ "$NEED_RELOAD" != 1 ] && [ "$ST_RELOAD_PENDING" = 1 ]; then
+        note "в прошлый раз перезагрузка sshd не удалась — повторяю"
+        NEED_RELOAD=1
+    fi
     if [ "$NEED_RELOAD" != 1 ]; then info "изменений в конфигурации sshd нет, перезагрузка не требуется"; return 0; fi
     if [ "$NO_RELOAD" = yes ]; then warn "--no-reload: sshd не перезагружен, изменения вступят в силу после перезагрузки службы"; return 0; fi
     if ! reload_sshd reload; then
-        warn "перезагрузите sshd вручную, иначе изменения не вступят в силу"
         RELOAD_FAILED=1
+        if [ "$SERVICE_WAS_UP" = 1 ] && ! wait_listening "$CUR_PORTS" 3; then
+            APPLY_OK=0
+            warn "после неудачной перезагрузки sshd не слушает ни старые, ни новые порты!"
+            rollback
+            die "откат выполнен, sshd перезапущен со старой конфигурацией"
+        fi
+        warn "sshd НЕ перезагружен и работает со старой конфигурацией. Перезагрузите его вручную; при следующем запуске скрипт повторит перезагрузку"
         return 0
     fi
     if [ "$SERVICE_WAS_UP" = 1 ]; then
@@ -1180,7 +1301,7 @@ do_reload() {
 }
 
 # ---------- Проверка эффективных значений ----------
-MISMATCH=0; RELOAD_FAILED=0
+MISMATCH=0
 locate_directive() {  # где в конфигурации встречается директива $1 (файл:строка активных вхождений)
     { grep -niE "^[[:space:]]*$1([[:space:]]|=)" "$SSHD_CONFIG" | sed "s|^|$SSHD_CONFIG:|"
       if [ -d "$DROPIN_DIR" ]; then for f in "$DROPIN_DIR"/*.conf; do [ -f "$f" ] && grep -niE "^[[:space:]]*$1([[:space:]]|=)" "$f" | sed "s|^|$f:|"; done; fi
@@ -1222,22 +1343,45 @@ verify_effective() {
 confirm_or_rollback() {
     [ "$CONFIRM_TIMEOUT" -gt 0 ] || return 0
     [ "$DRY_RUN" = yes ] && return 0
-    rm -f "$CONFIRM_FILE"
+    rm -f "$CONFIRM_FILE" "$CONFIRM_FILE.done"
     say ""
     note "ЖДУ ПОДТВЕРЖДЕНИЯ $CONFIRM_TIMEOUT с: откройте НОВОЕ окно, войдите по ключу и выполните:  sudo touch $CONFIRM_FILE"
-    note "(или нажмите Enter здесь). Без подтверждения все изменения будут откачены, sshd перезапущен."
-    rpid=""
-    if [ -r /dev/tty ]; then ( read -r _ < /dev/tty && : > "$CONFIRM_FILE" ) 2>/dev/null & rpid=$!; fi
+    note "(или нажмите Enter здесь). Без подтверждения, а также при обрыве этой сессии, все изменения будут откачены, sshd перезапущен."
+    # Сторож, независимый от терминала: переживает SIGHUP и откатывает сам, если основной процесс исчез,
+    # не откатив (например, убит SIGKILL). Журнал сторожа — рядом с бэкапами.
+    wdlog="$CFG_DIR/.secure_ssh.watchdog.log"
+    (
+        trap '' HUP INT TERM PIPE; set +e
+        exec >"$wdlog" 2>&1
+        i=0
+        while [ "$i" -lt "$((CONFIRM_TIMEOUT + 5))" ]; do
+            [ -f "$CONFIRM_FILE" ] && exit 0
+            [ -f "$CONFIRM_FILE.done" ] && exit 0
+            sleep 1; i=$((i + 1))
+        done
+        [ -f "$CONFIRM_FILE" ] || [ -f "$CONFIRM_FILE.done" ] && exit 0
+        warn "сторож: основной процесс не завершил ожидание, откатываю сам ($(date))"
+        rollback; : > "$CONFIRM_FILE.done"
+    ) &
+    WD_PID=$!
+    CONFIRM_PENDING=1
+    if [ -r /dev/tty ]; then ( read -r _ < /dev/tty && : > "$CONFIRM_FILE" ) 2>/dev/null & RPID=$!; fi
     i=0; confirmed=0
     while [ "$i" -lt "$CONFIRM_TIMEOUT" ]; do
         if [ -f "$CONFIRM_FILE" ]; then confirmed=1; break; fi
         sleep 1; i=$((i + 1))
     done
-    if [ -n "$rpid" ]; then kill "$rpid" 2>/dev/null || true; fi
-    rm -f "$CONFIRM_FILE"
-    if [ "$confirmed" = 1 ]; then ok "подтверждено, изменения сохранены"; return 0; fi
+    CONFIRM_PENDING=0
+    if [ -n "$RPID" ]; then kill "$RPID" 2>/dev/null || true; RPID=""; fi
+    if [ "$confirmed" = 1 ]; then
+        : > "$CONFIRM_FILE.done"; kill "$WD_PID" 2>/dev/null || true; WD_PID=""
+        rm -f "$CONFIRM_FILE" "$CONFIRM_FILE.done"
+        ok "подтверждено, изменения сохранены"; return 0
+    fi
     warn "подтверждение не получено за $CONFIRM_TIMEOUT с"
-    APPLY_OK=1; rollback
+    APPLY_OK=1; rollback; : > "$CONFIRM_FILE.done"
+    kill "$WD_PID" 2>/dev/null || true; WD_PID=""
+    rm -f "$CONFIRM_FILE" "$CONFIRM_FILE.done"
     say ""; note "Итог: изменения ОТКАЧЕНЫ по таймеру --confirm, sshd перезапущен со старой конфигурацией (ключи в authorized_keys остались)."
     exit 3
 }
@@ -1253,6 +1397,7 @@ write_state() {
         printf 'LOGIN_GRACE_TIME=%s\nCLIENT_ALIVE_INTERVAL=%s\nCLIENT_ALIVE_COUNT_MAX=%s\n' \
             "$LOGIN_GRACE_TIME" "$CLIENT_ALIVE_INTERVAL" "$CLIENT_ALIVE_COUNT_MAX"
         [ -n "$LOG_LEVEL" ] && printf 'LOG_LEVEL=%s\n' "$LOG_LEVEL"
+        [ "$RELOAD_FAILED" = 1 ] && printf 'RELOAD_PENDING=1\n'
     } > "$TMPDIR_/state.new"
     apply_file "$TMPDIR_/state.new" "$STATE_FILE" state
 }
@@ -1281,7 +1426,7 @@ summary() {
 
 # ---------- --check ----------
 do_check() {
-    plan_ports
+    compute_ports
     say ""
     say "──────── Проверка (ничего не меняется) ────────"
     say "Конфиг: $SSHD_CONFIG; режим: $CONFIG_MODE; Include: ${INCLUDE_PATTERN:-нет}"
@@ -1309,10 +1454,11 @@ do_check() {
     say ""
     say "Пользователи:"
     for u in $TARGET_USERS; do
-        h=$(user_home "$u"); ak=$(akf_for_user "$u" "$h")
-        sshd_T "$SSHD_CONFIG" "$u" > "$TMPDIR_/eff.u" 2>/dev/null || true
-        pa=$(eff_value "$TMPDIR_/eff.u" passwordauthentication); pk=$(eff_value "$TMPDIR_/eff.u" pubkeyauthentication)
+        h=$(user_home "$u"); ak=$(akf_for_user "$u" "$h" "$(user_uid "$u")")
+        pa=$(eff_value "$TMPDIR_/eff.user" passwordauthentication); pk=$(eff_value "$TMPDIR_/eff.user" pubkeyauthentication)
         say "  $u: AuthorizedKeysFile=$ak; с учётом Match: PasswordAuthentication=${pa:-?} PubkeyAuthentication=${pk:-?}"
+        user_allowed "$u" "$TMPDIR_/eff.user" || warn "  $u: вход запрещён: $ALLOW_REASON"
+        algs=$(eff_value "$TMPDIR_/eff.user" pubkeyacceptedalgorithms); [ -n "$algs" ] && say "    PubkeyAcceptedAlgorithms: $algs"
         if [ -f "$ak" ]; then
             n=$(grep -cvE '^[[:space:]]*(#|$)' "$ak" || true); g=$(grep -c "github:$GITHUB_USER\$" "$ak" || true)
             say "    активных ключей: $n (с меткой github:$GITHUB_USER: $g); права: $(file_mode "$ak"), владелец uid $(file_uid "$ak")"
@@ -1332,7 +1478,11 @@ do_check() {
 do_rollback() {
     src="${ROLLBACK_FROM:-$SSHD_CONFIG.orig}"
     [ -s "$src" ] || die "файл для отката $src не найден или пуст. Доступные бэкапы: $(ls "$SSHD_CONFIG".orig "$SSHD_CONFIG".bak.* 2>/dev/null | tr '\n' ' ')"
-    plan_ports
+    if [ -n "$ROLLBACK_FROM" ] && [ ! -f "$SSHD_CONFIG.orig" ] && ! grep -q 'secure_ssh.sh' "$src"; then
+        info "$SSHD_CONFIG.orig отсутствует; $src не содержит следов скрипта, сохраняю его как $SSHD_CONFIG.orig"
+        cp -p "$src" "$SSHD_CONFIG.orig" 2>/dev/null || true
+    fi
+    compute_ports
     note "откат: $SSHD_CONFIG <- $src"
     if cmp -s "$src" "$SSHD_CONFIG"; then ok "$SSHD_CONFIG уже совпадает с $src"; else show_diff "$SSHD_CONFIG" "$src"; fi
     if [ "$DRY_RUN" = yes ]; then
@@ -1340,6 +1490,7 @@ do_rollback() {
         [ -f "$BANNER_FILE.orig" ] && change RESTORE "$BANNER_FILE <- $BANNER_FILE.orig"
         info "DRY-RUN: ничего не изменено"; return 0
     fi
+    NO_ORIG=1   # при откате явным файлом «первоначальной копией» не должен стать уже изменённый конфиг
     apply_file "$src" "$SSHD_CONFIG" main
     if [ -f "$DROPIN_PATH" ]; then
         cp -p "$DROPIN_PATH" "$TMPDIR_/dropin.prev" && DROPIN_SAVED=existing
@@ -1353,8 +1504,9 @@ do_rollback() {
         say "$out" >&2; rollback; die "конфигурация из $src не проходит sshd -t, возвращено как было"
     fi
     APPLY_OK=1
-    WANT_PORTS=$(sshd_T "$SSHD_CONFIG" | awk '$1 == "port" { print $2 }' | tr '\n' ' '); WANT_PORTS=${WANT_PORTS% }
-    PORTS_CHANGED=0; same_set "$WANT_PORTS" "$CUR_PORTS" || PORTS_CHANGED=1
+    sshd_T "$SSHD_CONFIG" > "$TMPDIR_/eff.rb" || true
+    WANT_PORTS=$(eff_ports "$TMPDIR_/eff.rb"); WANT_PORTS=${WANT_PORTS% }
+    PORTS_CHANGED=0; same_set "$WANT_PORTS" "$CUR_PORTS" || { PORTS_CHANGED=1; warn "после отката порты sshd: $WANT_PORTS (были: $CUR_PORTS) — проверьте firewall"; }
     do_reload
     note "ключи в authorized_keys не удалялись. Порты sshd теперь: $WANT_PORTS"
     return 0
@@ -1386,6 +1538,7 @@ main() {
     resolve_users
     plan_ports
     for u in $TARGET_USERS; do install_keys_for_user "$u"; done
+    assert_login_possible
 
     build_main
     build_dropin
@@ -1404,6 +1557,7 @@ main() {
     confirm_or_rollback
     summary
     [ "$MISMATCH" = 1 ] && exit 2
+    [ "$RELOAD_FAILED" = 1 ] && exit 2
     exit 0
 }
 main "$@"

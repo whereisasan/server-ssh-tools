@@ -159,14 +159,22 @@ begin "ключ закомментирован / с command= считается 
 D=$(new_case c6); cfg_ubuntu "$D"; mkdir -p "$H/.ssh"; chmod 700 "$H/.ssh"
 printf '#ssh-ed25519 %s old\ncommand="echo no",no-pty ssh-rsa %s cloud\n' "$K1" "$K2" > "$AK"; chmod 600 "$AK"; chown -R sst_user "$H/.ssh"
 run "$D" --no-reload
-assert_rc 0; assert_out "предупреждение про ограниченный ключ" "закомментирован или с ограничениями"
-assert "активные строки добавлены" "grep -q \"^ssh-ed25519 $K1 \" '$AK' && grep -q \"^ssh-rsa $K2 \" '$AK'"
+assert_rc 0; assert_out "закомментированный ключ добавляется" "закомментирован в"; assert_out "ограниченный ключ остаётся" "оставляю как есть"
+assert "активная строка для закомментированного ключа" "grep -q \"^ssh-ed25519 $K1 \" '$AK'"
+assert "ограниченный ключ НЕ продублирован" "! grep -q \"^ssh-rsa $K2 \" '$AK'"
 assert "старые строки не тронуты" "grep -q '^#ssh-ed25519' '$AK' && grep -q '^command=' '$AK'"
+run "$D" --no-reload --unrestrict; assert_rc 0
+assert "--unrestrict добавил строку без ограничений" "grep -q \"^ssh-rsa $K2 \" '$AK'"
 begin "--prune удаляет устаревшие ключи с меткой"
 printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGQxv4ArgvxvUJ1SxV0bYrW6fYt0d9x4oH3j4fQ8t2Zs github:whereisasan\n' >> "$AK"
 run "$D" --no-reload --prune; assert_rc 0
 assert "устаревший удалён" "! grep -q AAAAIGQxv4ArgvxvUJ1SxV0bYrW6fYt0d9x4oH3j4fQ8t2Zs '$AK'"
 assert "нужные остались" "grep -q \"^ssh-ed25519 $K1 \" '$AK'"
+begin "только ограниченные ключи у единственного пользователя -> отказ"
+D=$(new_case c6r); cfg_ubuntu "$D"; mkdir -p "$H/.ssh"; chmod 700 "$H/.ssh"
+printf 'command="echo no" ssh-ed25519 %s c\ncommand="echo no" ssh-rsa %s c\n' "$K1" "$K2" > "$AK"; chmod 600 "$AK"; chown -R sst_user "$H/.ssh"
+run "$D" --no-reload; assert_rc 1; assert_out "сообщение" "не сможет никто"
+assert "конфиг не тронут" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
 begin "нестандартный AuthorizedKeysFile"
 D=$(new_case c6b); cfg_ubuntu "$D"; printf 'AuthorizedKeysFile %s/ak/%%u\n' "$D" >> "$D/sshd_config"
 run "$D" --no-reload; assert_rc 0
@@ -180,6 +188,31 @@ D=$(new_case c6d); cfg_ubuntu "$D"; printf 'victim\n' > "$D/victim"; chmod 644 "
 mkdir -p "$H/.ssh"; ln -s "$D/victim" "$AK"; chown -h sst_user "$H/.ssh" "$AK"
 run "$D" --no-reload; assert_rc 1
 assert "жертва не изменена" "[ \"\$(cat '$D/victim')\" = victim ] && [ \"\$(stat -c %U '$D/victim')\" = root ]"
+begin "заранее подложенный временный файл-симлинк не используется"
+D=$(new_case c6f); cfg_ubuntu "$D"; printf 'victim\n' > "$D/victim"; chmod 600 "$D/victim"
+mkdir -p "$H/.ssh"; chmod 700 "$H/.ssh"; ln -s "$D/victim" "$H/.ssh/authorized_keys.secure_ssh.tmp"; chown -R -h sst_user "$H/.ssh"
+run "$D" --no-reload; assert_rc 0
+assert "жертва не изменена" "[ \"\$(cat '$D/victim')\" = victim ] && [ \"\$(stat -c %U '$D/victim')\" = root ]"
+assert "ключи записаны в обычный файл" "[ ! -L '$AK' ] && grep -q \"$K1\" '$AK'"
+begin "AuthorizedKeysFile %h/authorized_keys: домашний каталог не становится 700"
+D=$(new_case c6g); cfg_ubuntu "$D"; printf 'AuthorizedKeysFile %%h/authorized_keys\n' >> "$D/sshd_config"; chmod 755 "$H"
+run "$D" --no-reload; assert_rc 0
+assert "ключ в \$HOME/authorized_keys" "grep -q \"$K1\" '$H/authorized_keys'"; assert "права дома не тронуты" "[ \"\$(stat -c %a '$H')\" = 755 ]"
+rm -f "$H/authorized_keys"
+begin "AuthorizedKeysFile с %U"
+D=$(new_case c6h); cfg_ubuntu "$D"; printf 'AuthorizedKeysFile %s/ak/%%U\n' "$D" >> "$D/sshd_config"
+run "$D" --no-reload; assert_rc 0; assert "файл по uid" "grep -q \"$K1\" '$D/ak/$(id -u sst_user)'"
+begin "AllowUsers без целевого пользователя -> отказ"
+D=$(new_case c6i); cfg_ubuntu "$D"; printf 'AllowUsers someoneelse\n' >> "$D/sshd_config"
+run "$D" --no-reload; assert_rc 1; assert_out "причина" "нет в AllowUsers"
+printf 'AllowUsers someoneelse sst_user\n' >> "$D/sshd_config"; sed -i '0,/^AllowUsers someoneelse$/{/^AllowUsers someoneelse$/d}' "$D/sshd_config"
+run "$D" --no-reload; assert_rc 0
+begin "PubkeyAcceptedAlgorithms без типа ключа -> отказ"
+D=$(new_case c6j); cfg_ubuntu "$D"; printf 'PubkeyAcceptedAlgorithms ssh-ed25519\n' >> "$D/sshd_config"
+cp "$T/k2.pub" "$T/rsa-only.keys"
+SSHD_CONFIG="$D/sshd_config" BANNER_FILE="$D/issue.net" STATE_FILE="$D/state" KEYS_FILE="$T/rsa-only.keys" TARGET_USERS=sst_user $SHELL_UNDER_TEST "$SCRIPT" --no-reload > "$D/out.txt" 2>&1; RC=$?; OUT="$D/out.txt"
+assert_rc 1; assert_out "причина" "не входит в PubkeyAcceptedAlgorithms"
+run "$D" --no-reload; assert_rc 0   # с ed25519 в списке всё в порядке
 begin "мусор вместо ключей -> отказ без изменений"
 D=$(new_case c6e); cfg_ubuntu "$D"; printf 'Not Found\n' > "$T/bad.keys"
 SSHD_CONFIG="$D/sshd_config" BANNER_FILE="$D/issue.net" STATE_FILE="$D/state" KEYS_FILE="$T/bad.keys" TARGET_USERS=sst_user $SHELL_UNDER_TEST "$SCRIPT" --no-reload > "$D/out.txt" 2>&1; RC=$?; OUT="$D/out.txt"
@@ -212,6 +245,9 @@ assert_rc 0; assert_out "diff показан" "+Port 2400"; assert_out "буду
 assert "файлы не созданы" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ] && [ ! -f '$D/sshd_config.orig' ] && [ ! -e '$AK' ] && [ ! -f '$D/state' ]"
 begin "--check"
 run "$D" --check; assert_rc 0; assert_out "эффективные значения" "Эффективные значения"; assert_out "предупреждение о паролях" "PasswordAuthentication yes"
+begin "--check --port не делает pre-flight смены порта"
+listen_port 24790; run "$D" --check --port 24790; stop_listener
+assert_rc 0; assert "нет вопросов и отказов" "! grep -q 'Сменить порты\|уже занят' '$OUT'"
 begin "--rollback"
 run "$D" --no-reload; assert_rc 0
 printf 'PasswordAuthentication yes\n' >> "$D/sshd_config.orig"   # отличие, чтобы увидеть восстановление
@@ -219,11 +255,31 @@ run "$D" --rollback --no-reload; assert_rc 0
 assert "main восстановлен из .orig" "cmp -s '$D/sshd_config' '$D/sshd_config.orig'"
 assert "drop-in удалён" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
 assert "state удалён" "[ ! -f '$D/state' ]"
+begin "--rollback ФАЙЛ без .orig не создаёт поддельный .orig"
+run "$D" --no-reload; assert_rc 0; rm -f "$D/sshd_config.orig"; cp "$D/sshd_config" "$D/modified.conf"
+run "$D" --rollback "$D/modified.conf" --no-reload; assert_rc 0
+assert ".orig не появился" "[ ! -f '$D/sshd_config.orig' ]"
+begin "ListenAddress host:port учитывается в текущих портах"
+D=$(new_case c8l); cfg_ubuntu "$D"; sed -i 's/^Port 2222/ListenAddress 127.0.0.1:2223/' "$D/sshd_config"
+run "$D" --check; assert_rc 0; assert_out "порт из ListenAddress" "2223"
 begin "--confirm без подтверждения -> откат, код 3"
 D=$(new_case c8b); cfg_ubuntu "$D"; cp "$D/sshd_config" "$T/pristine"
 run "$D" --no-reload --confirm 2 < /dev/null
 assert_rc 3; assert "main восстановлен" "cmp -s '$D/sshd_config' '$T/pristine'"
 assert "drop-in удалён" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
+begin "--confirm: SIGHUP (обрыв сессии) во время ожидания -> откат, код 3"
+D=$(new_case c8d); cfg_ubuntu "$D"; cp "$D/sshd_config" "$T/pristine"
+SSHD_CONFIG="$D/sshd_config" BANNER_FILE="$D/issue.net" STATE_FILE="$D/state" KEYS_FILE="$T/keys" TARGET_USERS=sst_user YES=yes CONFIRM_FILE="$D/confirmed" \
+    $SHELL_UNDER_TEST "$SCRIPT" --no-reload --confirm 30 > "$D/out.txt" 2>&1 < /dev/null & SP=$!
+sleep 4; kill -HUP $SP 2>/dev/null; wait $SP; RC=$?; OUT="$D/out.txt"
+assert_rc 3; assert "main восстановлен" "cmp -s '$D/sshd_config' '$T/pristine'"; assert "drop-in удалён" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
+begin "--confirm: SIGKILL основного процесса -> сторож откатывает сам"
+D=$(new_case c8e); cfg_ubuntu "$D"; cp "$D/sshd_config" "$T/pristine"
+SSHD_CONFIG="$D/sshd_config" BANNER_FILE="$D/issue.net" STATE_FILE="$D/state" KEYS_FILE="$T/keys" TARGET_USERS=sst_user YES=yes CONFIRM_FILE="$D/confirmed" \
+    $SHELL_UNDER_TEST "$SCRIPT" --no-reload --confirm 2 > "$D/out.txt" 2>&1 < /dev/null & SP=$!
+sleep 3; kill -9 $SP 2>/dev/null; wait $SP 2>/dev/null; sleep 7
+assert "сторож восстановил main" "cmp -s '$D/sshd_config' '$T/pristine'"; assert "сторож удалил drop-in" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
+assert "журнал сторожа" "grep -q 'сторож' '$D/.secure_ssh.watchdog.log'"
 begin "--confirm с подтверждением файлом"
 D=$(new_case c8c); cfg_ubuntu "$D"
 ( sleep 2; touch "$D/confirmed" ) &
@@ -245,6 +301,11 @@ SSHD_PIDS="$SSHD_PIDS $(cat "$D/sshd.pid" 2>/dev/null)"
 run "$D" --port $P2 --reload-method sighup
 assert_rc 0; assert_out "SIGHUP отправлен" "получил SIGHUP"; assert_out "порты слушаются" "sshd слушает порты"
 assert "новый порт открыт" "port_open $P2"; assert "старый порт открыт" "port_open $P1"
+begin "реальный sshd: отказ менеджера служб не блокирует SIGHUP (auto)"
+printf '#!/bin/sh\necho "fake service: not running" >&2; exit 1\n' > "$BIN/service"; chmod +x "$BIN/service"
+printf '#!/bin/sh\nexit 1\n' > "$BIN/rc-service"; chmod +x "$BIN/rc-service"; mkdir -p "$T/initd"
+run "$D" --tcp-forwarding no; rm -f "$BIN/service" "$BIN/rc-service"
+assert_rc 0; assert_out "дошли до SIGHUP" "получил SIGHUP"
 begin "реальный sshd: вход по ключу работает, по паролю нет"
 chmod 600 "$T/k1"
 assert "вход по ключу" "ssh -i '$T/k1' -p $P2 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes sst_user@127.0.0.1 true"
