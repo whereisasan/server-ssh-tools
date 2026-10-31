@@ -149,8 +149,7 @@ assert "PasswordAuthentication стоит выше Include" "awk 'tolower(\$1)==
 begin "lockout: PermitRootLogin no + только root -> отказ"
 D=$(new_case c5); cfg_ubuntu "$D"; USERS_OVERRIDE=root run "$D" --no-reload --permit-root-login no
 assert_rc 1; assert "ничего не записано" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ] && [ ! -f '$D/sshd_config.orig' ]"
-USERS_OVERRIDE=root run "$D" --no-reload --permit-root-login no --force; assert_rc 0
-rm -f /root/.ssh/authorized_keys.secure_ssh.tmp
+USERS_OVERRIDE=root run "$D" --no-reload --permit-root-login no --force --dry-run; assert_rc 0   # dry-run: не трогаем /root/.ssh
 begin "lockout: пустой список пользователей"
 D=$(new_case c5b); cfg_ubuntu "$D"; USERS_OVERRIDE=", " run "$D" --no-reload
 assert_rc 1; assert_out "сообщение" "список пользователей пуст"

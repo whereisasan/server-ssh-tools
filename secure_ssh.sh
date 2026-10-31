@@ -203,7 +203,8 @@ load_state() {
     while IFS='=' read -r k v || [ -n "$k" ]; do
         v=$(printf '%s' "$v" | tr -d '\r')
         case "$k" in
-            PORTS)                  ST_PORTS="$v" ;;
+            PORTS)                  for p in $v; do is_port "$p" || { warn "в $STATE_FILE некорректный PORTS='$v', игнорирую"; v=""; break; }; done
+                                    ST_PORTS="$v" ;;
             PERMIT_ROOT_LOGIN)      ST_PERMIT_ROOT_LOGIN="$v" ;;
             ALLOW_TCP_FORWARDING)   ST_ALLOW_TCP_FORWARDING="$v" ;;
             X11_FORWARDING)         ST_X11_FORWARDING="$v" ;;
@@ -1259,7 +1260,7 @@ write_state() {
 summary() {
     say ""
     say "──────── Итог ────────"
-    say "Режим:           $CONFIG_MODE${DROPIN_PATH:+ ($DROPIN_PATH)}"
+    if [ "$CONFIG_MODE" = dropin ]; then say "Режим:           dropin ($DROPIN_PATH)"; else say "Режим:           legacy ($SSHD_CONFIG)"; fi
     say "Порты sshd:      $WANT_PORTS$( [ "$PORTS_CHANGED" = 1 ] && printf ' (было: %s)' "$CUR_PORTS")"
     say "Вход по ключу:   ${LOGIN_MATRIX#, } — ключи $KEYS_SOURCE"
     [ -n "$STICKY_NOTE" ] && say "Из прошлого:    $STICKY_NOTE (сбросить: --reset)"
