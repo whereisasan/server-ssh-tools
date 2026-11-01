@@ -105,6 +105,7 @@ assert "ключи установлены" "grep -q \"^ssh-ed25519 $K1 \" '$AK' 
 assert "права authorized_keys 600" "[ \"\$(stat -c %a '$AK')\" = 600 ] && [ \"\$(stat -c %U '$AK')\" = sst_user ]"
 assert "бэкапы main" "[ -f '$D/sshd_config.orig' ] && ls '$D'/sshd_config.bak.* >/dev/null"
 assert "state записан" "grep -q '^ALLOW_TCP_FORWARDING=yes' '$D/state'"
+assert "LogLevel VERBOSE по умолчанию" "[ \"\$(eff '$D' loglevel)\" = VERBOSE ]"
 assert "баннер записан" "grep -q Administrator '$D/issue.net'"
 assert_out "итог: записано без перезагрузки" "Результат:.*не перезагружался"
 
@@ -253,8 +254,14 @@ D=$(new_case c6pk); cfg_legacy "$D"; run "$D" --no-reload --mode legacy --keep-a
 assert_rc 0; assert "LANG остался" "eff '$D' acceptenv | grep -qx LANG"; assert "LC_PVE_TICKET добавлен" "eff '$D' acceptenv | grep -qx LC_PVE_TICKET"
 begin "Proxmox определяется автоматически (pveversion в PATH)"
 D=$(new_case c6pv); cfg_ubuntu "$D"; printf '#!/bin/sh\necho pve-manager/8.2\n' > "$BIN/pveversion"; chmod +x "$BIN/pveversion"
-run "$D" --no-reload; rm -f "$BIN/pveversion"
+run "$D" --no-reload
 assert_rc 0; assert_out "сообщение о Proxmox" "обнаружен Proxmox VE"; assert "LC_PVE_TICKET принимается" "[ \"\$(eff '$D' acceptenv)\" = LC_PVE_TICKET ]"
+begin "Proxmox: --accept-env LANG не теряет LC_PVE_TICKET; --no-pve-ticket отключает"
+D=$(new_case c6pv2); cfg_ubuntu "$D"; run "$D" --no-reload --accept-env LANG
+assert_rc 0; assert "LANG и LC_PVE_TICKET" "eff '$D' acceptenv | grep -qx LANG && eff '$D' acceptenv | grep -qx LC_PVE_TICKET"
+D=$(new_case c6pv3); cfg_ubuntu "$D"; run "$D" --no-reload --accept-env LANG --no-pve-ticket
+assert_rc 0; assert "только LANG" "[ \"\$(eff '$D' acceptenv | tr '\n' ' ')\" = 'LANG ' ]"
+rm -f "$BIN/pveversion"
 begin "Proxmox: authorized_keys root — симлинк в /etc/pve/priv (эмуляция)"
 D=$(new_case c6ps); cfg_ubuntu "$D"; mkdir -p "$D/pve/priv" "$D/rootssh"; chmod 700 "$D/pve/priv"
 : > "$D/pve/priv/authorized_keys"; ln -s "$D/pve/priv/authorized_keys" "$D/rootssh/authorized_keys"
@@ -262,6 +269,29 @@ printf 'AuthorizedKeysFile %s/rootssh/authorized_keys\n' "$D" >> "$D/sshd_config
 USERS_OVERRIDE=root; run "$D" --no-reload; USERS_OVERRIDE=""
 assert_rc 0; assert_out "ссылка распознана" "ссылка root на"
 assert "ссылка цела" "[ -L '$D/rootssh/authorized_keys' ]"; assert "ключ записан по целевому пути" "grep -q \"$K1\" '$D/pve/priv/authorized_keys'"
+
+# --- 6c. дополнительное усиление ---
+begin "--strict-auth: AuthenticationMethods publickey, запоминается"
+D=$(new_case c6s); cfg_ubuntu "$D"; run "$D" --no-reload --strict-auth
+assert_rc 0; assert "authenticationmethods publickey" "[ \"\$(eff '$D' authenticationmethods)\" = publickey ]"
+run "$D" --no-reload; assert_rc 0; assert "strict-auth сохранился" "[ \"\$(eff '$D' authenticationmethods)\" = publickey ]"
+begin "--allow-group: пользователь не в группе -> отказ; в группе -> AllowGroups применён"
+D=$(new_case c6g2); cfg_ubuntu "$D"; run "$D" --no-reload --allow-group nosuchgroup_xyz
+assert_rc 1; assert_out "причина" "не состоит в группах"; assert "ничего не записано" "[ ! -f '$D/sshd_config.orig' ]"
+G=$(id -gn sst_user); run "$D" --no-reload --allow-group "$G"
+assert_rc 0; assert "allowgroups содержит группу" "eff '$D' allowgroups | grep -qx \"$G\""
+begin "--idle-timeout и --agent-forwarding"
+D=$(new_case c6t); cfg_ubuntu "$D"; run "$D" --no-reload --idle-timeout 600 --agent-forwarding no
+assert_rc 0; assert "agent forwarding no" "[ \"\$(eff '$D' allowagentforwarding)\" = no ]"
+if [ "$V_MAJ" -gt 9 ] || { [ "$V_MAJ" -eq 9 ] && [ "$V_MIN" -ge 2 ]; }; then
+    assert "UnusedConnectionTimeout" "[ \"\$(eff '$D' unusedconnectiontimeout)\" = 600 ]"
+    assert "ChannelTimeout session" "[ \"\$(eff '$D' channeltimeout)\" = session=600 ]"
+else
+    assert_out "предупреждение о версии" "idle-timeout не поддерживается"
+fi
+begin "--log-level keep не трогает LogLevel"
+D=$(new_case c6ll); cfg_ubuntu "$D"; printf 'LogLevel INFO\n' >> "$D/sshd_config"; run "$D" --no-reload --log-level keep
+assert_rc 0; assert "LogLevel остался INFO" "[ \"\$(eff '$D' loglevel)\" = INFO ]"
 
 # --- 7. сбои записи ---
 begin "будущая конфигурация не проходит sshd -t -> ничего не записано"
@@ -343,7 +373,7 @@ D=$(new_case c10); cfg_ubuntu "$D"; P1=24601; P2=24602
 sed -i "s/^Port 2222/Port $P1/" "$D/sshd_config"; printf 'PidFile %s/sshd.pid\n' "$D" >> "$D/sshd_config"
 mkdir -p /run/sshd; "$SSHD" -f "$D/sshd_config" -E "$D/sshd.log" && sleep 1
 SSHD_PIDS="$SSHD_PIDS $(cat "$D/sshd.pid" 2>/dev/null)"
-run "$D" --port $P2 --reload-method sighup
+run "$D" --port $P2 --reload-method sighup --strict-auth
 assert_rc 0; assert_out "SIGHUP отправлен" "получил SIGHUP"; assert_out "порты слушаются" "sshd слушает порты"
 assert "новый порт открыт" "port_open $P2"; assert "старый порт открыт" "port_open $P1"
 begin "реальный sshd: отказ менеджера служб не блокирует SIGHUP (auto)"

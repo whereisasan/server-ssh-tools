@@ -37,7 +37,12 @@ MAX_AUTH_TRIES="${MAX_AUTH_TRIES:-}"             # по умолчанию 6
 LOGIN_GRACE_TIME="${LOGIN_GRACE_TIME:-}"         # по умолчанию 30
 CLIENT_ALIVE_INTERVAL="${CLIENT_ALIVE_INTERVAL:-}"   # по умолчанию 300
 CLIENT_ALIVE_COUNT_MAX="${CLIENT_ALIVE_COUNT_MAX:-}" # по умолчанию 2
-LOG_LEVEL="${LOG_LEVEL:-}"                       # пусто = не трогать
+LOG_LEVEL="${LOG_LEVEL:-}"                       # по умолчанию VERBOSE (в журнале отпечаток ключа); keep = не трогать
+STRICT_AUTH="${STRICT_AUTH:-no}"                 # AuthenticationMethods publickey
+ALLOW_GROUPS="${ALLOW_GROUPS:-}"                 # AllowGroups: только эти группы могут входить
+IDLE_TIMEOUT="${IDLE_TIMEOUT:-}"                 # секунд простоя до закрытия сессии (OpenSSH >= 9.2)
+ALLOW_AGENT_FORWARDING="${ALLOW_AGENT_FORWARDING:-}"  # пусто = не трогать
+NO_PVE_TICKET="${NO_PVE_TICKET:-no}"             # на Proxmox не добавлять LC_PVE_TICKET в AcceptEnv
 DISABLE_ACCEPT_ENV="${DISABLE_ACCEPT_ENV:-yes}"  # комментировать все глобальные AcceptEnv
 ACCEPT_ENV="${ACCEPT_ENV:-}"                     # переменные, которые sshd всё же должен принимать (Proxmox: LC_PVE_TICKET)
 BANNER="${BANNER:-yes}"
@@ -63,7 +68,7 @@ RESET_STATE="${RESET_STATE:-no}"
 ACTION=apply                                     # apply | check | rollback
 ROLLBACK_FROM=""
 
-D_PERMIT_ROOT_LOGIN=prohibit-password; D_ALLOW_TCP_FORWARDING=yes; D_X11_FORWARDING=no
+D_PERMIT_ROOT_LOGIN=prohibit-password; D_ALLOW_TCP_FORWARDING=yes; D_X11_FORWARDING=no; D_LOG_LEVEL=VERBOSE
 D_MAX_AUTH_TRIES=6; D_LOGIN_GRACE_TIME=30; D_CLIENT_ALIVE_INTERVAL=300; D_CLIENT_ALIVE_COUNT_MAX=2
 
 usage() {
@@ -96,10 +101,16 @@ secure_ssh.sh v$VERSION — безопасная настройка sshd + кл�
       --tcp-forwarding V    yes|no, туннели и VS Code Remote (по умолчанию $D_ALLOW_TCP_FORWARDING)
       --x11 V               yes|no (по умолчанию $D_X11_FORWARDING)
       --max-auth-tries N    (по умолчанию $D_MAX_AUTH_TRIES)
-      --log-level V         LogLevel (по умолчанию не трогается)
+      --log-level V         LogLevel (по умолчанию $D_LOG_LEVEL: в журнале виден отпечаток ключа; keep = не трогать)
+      --strict-auth         AuthenticationMethods publickey: только ключ, другие методы невозможны (STRICT_AUTH)
+      --allow-group G1,G2   AllowGroups: входить могут только участники этих групп (ALLOW_GROUPS);
+                            целевые пользователи должны состоять в одной из них, иначе отказ
+      --idle-timeout N      закрывать сессии без активности через N секунд (OpenSSH >= 9.2) (IDLE_TIMEOUT)
+      --agent-forwarding V  yes|no, проброс ssh-agent (ALLOW_AGENT_FORWARDING; по умолчанию не трогается)
       --keep-accept-env     не комментировать AcceptEnv (DISABLE_ACCEPT_ENV=no)
       --accept-env "V1 V2"  принимать перечисленные переменные окружения (ACCEPT_ENV);
-                            на Proxmox VE автоматически LC_PVE_TICKET — без него не работает консоль VM с другой ноды
+                            на Proxmox VE LC_PVE_TICKET добавляется к списку всегда (иначе не работает консоль VM
+                            с другой ноды); отключить это можно только флагом --no-pve-ticket
       --no-banner           не ставить баннер (BANNER=no)
       --banner-admin TEXT   подпись в баннере (BANNER_ADMIN=$BANNER_ADMIN)
       --mode auto|dropin|legacy  куда писать настройки (CONFIG_MODE=$CONFIG_MODE)
@@ -163,6 +174,11 @@ parse_args() {
             --x11)               need_arg "$@"; X11_FORWARDING="$2"; shift 2 ;;
             --max-auth-tries)    need_arg "$@"; MAX_AUTH_TRIES="$2"; shift 2 ;;
             --log-level)         need_arg "$@"; LOG_LEVEL="$2"; shift 2 ;;
+            --strict-auth)       STRICT_AUTH=yes; shift ;;
+            --allow-group|--allow-groups) need_arg "$@"; ALLOW_GROUPS="$2"; shift 2 ;;
+            --idle-timeout)      need_arg "$@"; IDLE_TIMEOUT="$2"; shift 2 ;;
+            --agent-forwarding)  need_arg "$@"; ALLOW_AGENT_FORWARDING="$2"; shift 2 ;;
+            --no-pve-ticket)     NO_PVE_TICKET=yes; shift ;;
             --keep-accept-env)   DISABLE_ACCEPT_ENV=no; shift ;;
             --accept-env)        need_arg "$@"; ACCEPT_ENV="$2"; shift 2 ;;
             --no-banner)         BANNER=no; shift ;;
@@ -205,6 +221,7 @@ is_port()   { is_uint "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 ST_PORTS=""; ST_PERMIT_ROOT_LOGIN=""; ST_ALLOW_TCP_FORWARDING=""; ST_X11_FORWARDING=""
 ST_MAX_AUTH_TRIES=""; ST_LOGIN_GRACE_TIME=""; ST_CLIENT_ALIVE_INTERVAL=""; ST_CLIENT_ALIVE_COUNT_MAX=""
 ST_LOG_LEVEL=""; ST_MODE=""; ST_RELOAD_PENDING=""; ST_ACCEPT_ENV=""
+ST_STRICT_AUTH=""; ST_ALLOW_GROUPS=""; ST_IDLE_TIMEOUT=""; ST_ALLOW_AGENT_FORWARDING=""
 load_state() {
     [ -f "$STATE_FILE" ] || return 0
     while IFS='=' read -r k v || [ -n "$k" ]; do
@@ -221,6 +238,10 @@ load_state() {
             CLIENT_ALIVE_COUNT_MAX) ST_CLIENT_ALIVE_COUNT_MAX="$v" ;;
             LOG_LEVEL)              ST_LOG_LEVEL="$v" ;;
             ACCEPT_ENV)             ST_ACCEPT_ENV="$v" ;;
+            STRICT_AUTH)            ST_STRICT_AUTH="$v" ;;
+            ALLOW_GROUPS)           ST_ALLOW_GROUPS="$v" ;;
+            IDLE_TIMEOUT)           ST_IDLE_TIMEOUT="$v" ;;
+            ALLOW_AGENT_FORWARDING) ST_ALLOW_AGENT_FORWARDING="$v" ;;
             MODE)                   ST_MODE="$v" ;;
             RELOAD_PENDING)         ST_RELOAD_PENDING="$v" ;;
         esac
@@ -265,10 +286,22 @@ validate_params() {
     case "$RELOAD_METHOD" in auto|systemd|openrc|service|sighup) ;; *) die "--reload-method: ожидается auto|systemd|openrc|service|sighup" ;; esac
     if [ -n "$SSH_PORT" ]; then is_port "$SSH_PORT" || die "--port: ожидается число 1..65535"; fi
     if [ "$KEEP_OLD_PORT" = no ] && [ -z "$SSH_PORT" ]; then die "--close-old-port имеет смысл только вместе с --port"; fi
+    LOG_LEVEL=$(printf '%s' "$LOG_LEVEL" | tr '[:lower:]' '[:upper:]')
     case "$LOG_LEVEL" in
+        KEEP|NONE) LOG_LEVEL="" ;;
         ''|QUIET|FATAL|ERROR|INFO|VERBOSE|DEBUG|DEBUG1|DEBUG2|DEBUG3) ;;
-        *) die "--log-level: ожидается QUIET|FATAL|ERROR|INFO|VERBOSE|DEBUG" ;;
+        *) die "--log-level: ожидается QUIET|FATAL|ERROR|INFO|VERBOSE|DEBUG|keep" ;;
     esac
+    STRICT_AUTH=$(norm_yn "$STRICT_AUTH"); is_yes_no "$STRICT_AUTH" || die "STRICT_AUTH: ожидается yes|no"
+    NO_PVE_TICKET=$(norm_yn "$NO_PVE_TICKET"); is_yes_no "$NO_PVE_TICKET" || die "NO_PVE_TICKET: ожидается yes|no"
+    if [ -n "$ALLOW_AGENT_FORWARDING" ]; then
+        ALLOW_AGENT_FORWARDING=$(norm_yn "$ALLOW_AGENT_FORWARDING"); is_yes_no "$ALLOW_AGENT_FORWARDING" || die "--agent-forwarding: ожидается yes|no"
+    fi
+    if [ -n "$IDLE_TIMEOUT" ]; then is_uint "$IDLE_TIMEOUT" || die "--idle-timeout: ожидается число секунд (0 = выключить)"; fi
+    ALLOW_GROUPS=$(printf '%s' "$ALLOW_GROUPS" | tr ',' ' ')
+    for g in $ALLOW_GROUPS; do
+        case "$g" in *[!A-Za-z0-9_.@*?-]*) die "--allow-group: недопустимое имя группы '$g'" ;; esac
+    done
     case "$GITHUB_USER" in
         ''|*[!A-Za-z0-9-]*) die "GITHUB_USER содержит недопустимые символы: '$GITHUB_USER'" ;;
     esac
@@ -530,6 +563,9 @@ detect_mode() {
         warn "в прошлый раз использовался режим $ST_MODE, сейчас $CONFIG_MODE"
     fi
     info "режим записи настроек: $CONFIG_MODE"
+    if [ -n "$IDLE_TIMEOUT" ] && [ "$IDLE_TIMEOUT" -gt 0 ] && ! ver_ge 9 2; then
+        warn "--idle-timeout не поддерживается OpenSSH $SSHD_MAJOR.$SSHD_MINOR (нужен 9.2+: UnusedConnectionTimeout/ChannelTimeout), пропускаю"
+    fi
     detect_pve
 }
 # Proxmox VE: консоль VM с другой ноды передаёт билет через переменную LC_PVE_TICKET по ssh,
@@ -538,11 +574,14 @@ IS_PVE=0
 detect_pve() {
     if [ -d /etc/pve ] || have pveversion; then IS_PVE=1; fi
     [ "$IS_PVE" = 1 ] || return 0
-    if [ -z "$ACCEPT_ENV" ]; then
-        ACCEPT_ENV="LC_PVE_TICKET"
-        info "обнаружен Proxmox VE: sshd будет принимать LC_PVE_TICKET (консоль VM между нодами). Переопределить: --accept-env"
+    if [ "$NO_PVE_TICKET" = yes ]; then
+        warn "Proxmox VE: --no-pve-ticket — LC_PVE_TICKET не принимается, консоль VM с другой ноды работать не будет"
     else
-        case " $ACCEPT_ENV " in *" LC_PVE_TICKET "*|*" LC_* "*) ;; *) warn "Proxmox VE: в --accept-env нет LC_PVE_TICKET — консоль VM с другой ноды работать не будет" ;; esac
+        case " $ACCEPT_ENV " in
+            *" LC_PVE_TICKET "*|*" LC_* "*) ;;
+            *) ACCEPT_ENV="${ACCEPT_ENV:+$ACCEPT_ENV }LC_PVE_TICKET" ;;
+        esac
+        info "обнаружен Proxmox VE: sshd будет принимать LC_PVE_TICKET (консоль VM между нодами); AcceptEnv: $ACCEPT_ENV"
     fi
     [ "$ALLOW_TCP_FORWARDING" = yes ] || warn "Proxmox VE: AllowTcpForwarding no сломает миграцию VM по ssh-туннелю"
 }
@@ -828,6 +867,14 @@ install_keys_for_user() {
         warn "$u: sshd не пустит этого пользователя: $ALLOW_REASON. Ключ поставлю, но входа не будет"
         can_login=0
     fi
+    if [ -n "$ALLOW_GROUPS" ] && [ "$can_login" = 1 ]; then
+        okk=0; for g in $(id -Gn "$u" 2>/dev/null); do for pat in $ALLOW_GROUPS; do glob_match "$g" "$pat" && okk=1; done; done
+        if [ "$okk" = 0 ]; then
+            ALLOW_REASON="не состоит в группах из --allow-group ($ALLOW_GROUPS); добавить: usermod -aG ${ALLOW_GROUPS%% *} $u"
+            warn "$u: после применения AllowGroups $ALLOW_GROUPS этот пользователь войти не сможет: $ALLOW_REASON"
+            can_login=0
+        fi
+    fi
     if [ -L "$ak" ] && [ "$uid" = 0 ] && [ "$(file_uid "$ak")" = 0 ]; then
         target=$(readlink -f "$ak" 2>/dev/null || true)
         if [ -n "$target" ] && [ -d "$(dirname "$target")" ] && [ "$(file_uid "$(dirname "$target")")" = 0 ]; then
@@ -1078,6 +1125,13 @@ managed_directives() {
     if [ -n "$LOG_LEVEL" ]; then printf 'LogLevel %s\n' "$LOG_LEVEL"; fi
     if [ "$BANNER" = yes ]; then printf 'Banner %s\n' "$BANNER_FILE"; fi
     if [ -n "$ACCEPT_ENV" ]; then printf 'AcceptEnv %s\n' "$ACCEPT_ENV"; fi
+    if [ "$STRICT_AUTH" = yes ]; then printf 'AuthenticationMethods publickey\n'; fi
+    if [ -n "$ALLOW_GROUPS" ]; then printf 'AllowGroups %s\n' "$ALLOW_GROUPS"; fi
+    if [ -n "$ALLOW_AGENT_FORWARDING" ]; then printf 'AllowAgentForwarding %s\n' "$ALLOW_AGENT_FORWARDING"; fi
+    if [ -n "$IDLE_TIMEOUT" ] && [ "$IDLE_TIMEOUT" -gt 0 ] && ver_ge 9 2; then
+        printf 'UnusedConnectionTimeout %s\n' "$IDLE_TIMEOUT"
+        printf 'ChannelTimeout session=%s\n' "$IDLE_TIMEOUT"
+    fi
 }
 # Все значения директивы $1 в глобальной секции файла $2 (до первого Match), по одному в строке
 get_global_all() {
@@ -1172,13 +1226,13 @@ build_main() {
   Port: ${cur:-<по умолчанию 22>} -> $WANT_PORTS"
                 continue
             fi
-            if [ "$key" = AcceptEnv ]; then   # накопительная: добавляем свою строку, чужие активные (при --keep-accept-env) не трогаем
-                if get_global_all AcceptEnv "$TMPDIR_/main.new" | grep -qxF -- "$val"; then ok "AcceptEnv $val уже есть"; continue; fi
-                insert_global AcceptEnv "AcceptEnv $val" "$TMPDIR_/main.new" > "$TMPDIR_/main.tmp" && mv "$TMPDIR_/main.tmp" "$TMPDIR_/main.new"
+            case "$key" in AcceptEnv|AllowGroups)   # накопительные: добавляем свою строку, чужие активные не трогаем
+                if get_global_all "$key" "$TMPDIR_/main.new" | grep -qxF -- "$val"; then ok "$key $val уже есть"; continue; fi
+                insert_global "$key" "$key $val" "$TMPDIR_/main.new" > "$TMPDIR_/main.tmp" && mv "$TMPDIR_/main.tmp" "$TMPDIR_/main.new"
                 MAIN_CHANGES="$MAIN_CHANGES
-  AcceptEnv $val (добавлено)"
-                continue
-            fi
+  $key $val (добавлено)"
+                continue ;;
+            esac
             cur=$(get_global "$key" "$TMPDIR_/main.new")
             if [ "$(lower "$cur")" = "$(lower "$val")" ]; then ok "$key уже = $val"; continue; fi
             set_global "$key" "$key $val" "$TMPDIR_/main.new" > "$TMPDIR_/main.tmp" && mv "$TMPDIR_/main.tmp" "$TMPDIR_/main.new"
@@ -1378,9 +1432,15 @@ verify_effective() {
         miss=""; for v in $ACCEPT_ENV; do in_list "$v" "$got" || miss="$miss $v"; done
         if [ -z "$miss" ]; then ok "эффективно: AcceptEnv $got"; else MISMATCH=1; warn "эффективно: AcceptEnv = '$got', не хватает:$miss"; fi
     fi
+    if [ -n "$ALLOW_GROUPS" ]; then
+        got=$(eff_values "$efff" allowgroups | tr '\n' ' '); miss=""
+        for g in $ALLOW_GROUPS; do in_list "$g" "$got" || miss="$miss $g"; done
+        if [ -z "$miss" ]; then ok "эффективно: AllowGroups ${got% }"; else MISMATCH=1; warn "эффективно: AllowGroups = '${got% }', не хватает:$miss"; fi
+    fi
     while read -r key val; do
         [ "$key" = Port ] && continue
         [ "$key" = AcceptEnv ] && continue
+        [ "$key" = AllowGroups ] && continue
         k=$(lower "$key"); v=$(lower "$val")
         got=$(eff_value "$efff" "$k")
         [ "$k" = permitrootlogin ] && [ "$v" = prohibit-password ] && v=without-password
@@ -1399,6 +1459,9 @@ verify_effective() {
         if [ "$pa" != no ] || [ "$pk" != yes ]; then
             MISMATCH=1
             warn "для пользователя $u (с учётом Match): PasswordAuthentication=$pa PubkeyAuthentication=$pk — проверьте блоки Match в $SSHD_CONFIG"
+        fi
+        if ! user_allowed "$u" "$TMPDIR_/eff.u"; then
+            case "$u:$PERMIT_ROOT_LOGIN" in root:no|root:forced-commands-only) ;; *) MISMATCH=1; warn "для пользователя $u вход запрещён: $ALLOW_REASON" ;; esac
         fi
     done
 }
@@ -1462,6 +1525,10 @@ write_state() {
             "$LOGIN_GRACE_TIME" "$CLIENT_ALIVE_INTERVAL" "$CLIENT_ALIVE_COUNT_MAX"
         [ -n "$LOG_LEVEL" ] && printf 'LOG_LEVEL=%s\n' "$LOG_LEVEL"
         [ -n "$ACCEPT_ENV" ] && printf 'ACCEPT_ENV=%s\n' "$ACCEPT_ENV"
+        printf 'STRICT_AUTH=%s\n' "$STRICT_AUTH"
+        [ -n "$ALLOW_GROUPS" ] && printf 'ALLOW_GROUPS=%s\n' "$ALLOW_GROUPS"
+        [ -n "$IDLE_TIMEOUT" ] && printf 'IDLE_TIMEOUT=%s\n' "$IDLE_TIMEOUT"
+        [ -n "$ALLOW_AGENT_FORWARDING" ] && printf 'ALLOW_AGENT_FORWARDING=%s\n' "$ALLOW_AGENT_FORWARDING"
         [ "$RELOAD_FAILED" = 1 ] && printf 'RELOAD_PENDING=1\n'
     } > "$TMPDIR_/state.new"
     apply_file "$TMPDIR_/state.new" "$STATE_FILE" state
@@ -1589,8 +1656,12 @@ main() {
     pick LOGIN_GRACE_TIME "$ST_LOGIN_GRACE_TIME" "$D_LOGIN_GRACE_TIME"
     pick CLIENT_ALIVE_INTERVAL "$ST_CLIENT_ALIVE_INTERVAL" "$D_CLIENT_ALIVE_INTERVAL"
     pick CLIENT_ALIVE_COUNT_MAX "$ST_CLIENT_ALIVE_COUNT_MAX" "$D_CLIENT_ALIVE_COUNT_MAX"
-    pick LOG_LEVEL "$ST_LOG_LEVEL" ""
+    pick LOG_LEVEL "$ST_LOG_LEVEL" "$D_LOG_LEVEL"
     pick ACCEPT_ENV "$ST_ACCEPT_ENV" ""
+    [ "$STRICT_AUTH" = no ] && [ "$ST_STRICT_AUTH" = yes ] && { STRICT_AUTH=yes; STICKY_NOTE="$STICKY_NOTE STRICT_AUTH=yes"; }
+    pick ALLOW_GROUPS "$ST_ALLOW_GROUPS" ""
+    pick IDLE_TIMEOUT "$ST_IDLE_TIMEOUT" ""
+    pick ALLOW_AGENT_FORWARDING "$ST_ALLOW_AGENT_FORWARDING" ""
     validate_params
     [ -n "$STICKY_NOTE" ] && info "значения из прошлого запуска:$STICKY_NOTE (явный флаг их переопределяет, --reset сбрасывает)"
     precheck_config
