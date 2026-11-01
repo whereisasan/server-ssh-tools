@@ -86,6 +86,7 @@ run() {  # run КАТАЛОГ [аргументы] -> OUT, RC
     d="$1"; shift
     OUT="$d/out.txt"
     SSHD_CONFIG="$d/sshd_config" BANNER_FILE="$d/issue.net" STATE_FILE="$d/state" KEYS_FILE="$T/keys" \
+    SSHD_BIN="${SSHD_BIN:-}" CONFIRM_FILE="${CONFIRM_FILE:-}" \
     TARGET_USERS="${USERS_OVERRIDE:-sst_user}" YES=yes $SHELL_UNDER_TEST "$SCRIPT" "$@" > "$OUT" 2>&1
     RC=$?
 }
@@ -167,11 +168,12 @@ fi
 
 # --- 5. защита от lockout ---
 begin "lockout: PermitRootLogin no + только root -> отказ"
-D=$(new_case c5); cfg_ubuntu "$D"; USERS_OVERRIDE=root run "$D" --no-reload --permit-root-login no
+D=$(new_case c5); cfg_ubuntu "$D"; USERS_OVERRIDE=root; run "$D" --no-reload --permit-root-login no
 assert_rc 1; assert "ничего не записано" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ] && [ ! -f '$D/sshd_config.orig' ]"
-USERS_OVERRIDE=root run "$D" --no-reload --permit-root-login no --force --dry-run; assert_rc 0   # dry-run: не трогаем /root/.ssh
+run "$D" --no-reload --permit-root-login no --force --dry-run; assert_rc 0   # dry-run: не трогаем /root/.ssh
+USERS_OVERRIDE=""
 begin "lockout: пустой список пользователей"
-D=$(new_case c5b); cfg_ubuntu "$D"; USERS_OVERRIDE=", " run "$D" --no-reload
+D=$(new_case c5b); cfg_ubuntu "$D"; USERS_OVERRIDE=", "; run "$D" --no-reload; USERS_OVERRIDE=""
 assert_rc 1; assert_out "сообщение" "список пользователей пуст"
 
 # --- 6. ключи ---
@@ -242,7 +244,7 @@ assert_rc 1; assert "ничего не записано" "[ ! -f '$D/sshd_config
 begin "будущая конфигурация не проходит sshd -t -> ничего не записано"
 D=$(new_case c7); cfg_ubuntu "$D"; cp "$D/sshd_config" "$T/pristine"
 printf '#!/bin/sh\nif [ "$1" = -t ] && grep -q PermitEmptyPasswords "$3" 2>/dev/null; then echo "fake: bad option" >&2; exit 255; fi\nexec %s "$@"\n' "$SSHD" > "$BIN/sshd-fail"; chmod +x "$BIN/sshd-fail"
-SSHD_BIN="$BIN/sshd-fail" run "$D" --no-reload --mode legacy
+SAVED_SSHD_BIN="${SSHD_BIN:-}"; SSHD_BIN="$BIN/sshd-fail"; run "$D" --no-reload --mode legacy; SSHD_BIN="$SAVED_SSHD_BIN"
 assert_rc 1; assert_out "ошибка валидации" "не проходит sshd -t"
 assert "main не тронут" "[ ! -f '$D/sshd_config.orig' ] && same_f '$D/sshd_config' '$T/pristine' && [ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
 begin "нет места на диске -> отказ, конфиг цел"
@@ -303,7 +305,7 @@ assert "журнал сторожа" "grep -q 'сторож' '$D/.secure_ssh.wat
 begin "--confirm с подтверждением файлом"
 D=$(new_case c8c); cfg_ubuntu "$D"
 ( sleep 2; touch "$D/confirmed" ) &
-CONFIRM_FILE="$D/confirmed" run "$D" --no-reload --confirm 10 < /dev/null
+CONFIRM_FILE="$D/confirmed"; run "$D" --no-reload --confirm 10 < /dev/null; CONFIRM_FILE=""
 assert_rc 0; assert_out "подтверждено" "подтверждено"
 wait
 
