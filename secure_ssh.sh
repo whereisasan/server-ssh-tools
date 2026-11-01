@@ -284,6 +284,12 @@ user_home() {
     if have getent; then getent passwd "$1" | cut -d: -f6
     else U="$1" awk -F: '$1 == ENVIRON["U"] { print $6 }' /etc/passwd; fi
 }
+# Одинаково ли содержимое двух файлов (cmp есть не везде: минимальные образы RHEL без diffutils)
+same_file() {
+    [ -f "$1" ] && [ -f "$2" ] || return 1
+    if have cmp; then cmp -s "$1" "$2"; return $?; fi
+    [ "$(cksum < "$1")" = "$(cksum < "$2")" ]
+}
 # Строки файла без \r (sshd_config, отредактированный в Windows)
 cfg_lines() { tr -d '\r' < "$1"; }
 
@@ -1132,7 +1138,7 @@ build_main() {
         MAIN_CHANGES="$MAIN_CHANGES
   закомментированы все глобальные AcceptEnv (клиент не сможет навязать переменные окружения)"
     fi
-    if ! cmp -s "$TMPDIR_/main.new" "$SSHD_CONFIG"; then MAIN_CHANGED=1; fi
+    if ! same_file "$TMPDIR_/main.new" "$SSHD_CONFIG"; then MAIN_CHANGED=1; fi
 }
 build_dropin() {
     [ "$CONFIG_MODE" = dropin ] || return 0
@@ -1141,7 +1147,7 @@ build_dropin() {
         printf '# Имя с префиксом 00- даёт приоритет над 50-cloud-init.conf, 50-redhat.conf и т.п.\n'
         managed_directives
     } > "$TMPDIR_/dropin.new"
-    if [ ! -f "$DROPIN_PATH" ] || ! cmp -s "$TMPDIR_/dropin.new" "$DROPIN_PATH"; then DROPIN_CHANGED=1; fi
+    if [ ! -f "$DROPIN_PATH" ] || ! same_file "$TMPDIR_/dropin.new" "$DROPIN_PATH"; then DROPIN_CHANGED=1; fi
 }
 # Проверить будущую конфигурацию sshd -t во временной копии, ещё ничего не записав
 validate_candidate() {
@@ -1167,19 +1173,19 @@ validate_candidate() {
 backup_main() {
     [ -n "$RUN_BACKUP" ] && return 0
     if [ ! -f "$SSHD_CONFIG.orig" ] && [ "$NO_ORIG" = 0 ]; then
-        cp -p "$SSHD_CONFIG" "$SSHD_CONFIG.orig" && cmp -s "$SSHD_CONFIG" "$SSHD_CONFIG.orig" \
+        cp -p "$SSHD_CONFIG" "$SSHD_CONFIG.orig" && same_file "$SSHD_CONFIG" "$SSHD_CONFIG.orig" \
             || { rm -f "$SSHD_CONFIG.orig"; die "не удалось сохранить первоначальную копию $SSHD_CONFIG.orig (нет места?)"; }
         info "первоначальная копия сохранена: $SSHD_CONFIG.orig"
     fi
     b="$SSHD_CONFIG.bak.$(date +%Y%m%d-%H%M%S)"
-    cp -p "$SSHD_CONFIG" "$b" && cmp -s "$SSHD_CONFIG" "$b" || { rm -f "$b"; die "не удалось создать бэкап $b (нет места?)"; }
+    cp -p "$SSHD_CONFIG" "$b" && same_file "$SSHD_CONFIG" "$b" || { rm -f "$b"; die "не удалось создать бэкап $b (нет места?)"; }
     RUN_BACKUP="$b"
     info "бэкап перед изменением: $RUN_BACKUP"
 }
 # apply_file ИСТОЧНИК ЦЕЛЬ main|dropin|banner|state — атомарная запись с бэкапом; сбой = откат и выход
 apply_file() {
     src="$1"; dst="$2"; kind="$3"
-    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then return 0; fi
+    if [ -f "$dst" ] && same_file "$src" "$dst"; then return 0; fi
     case "$kind" in
         main)   backup_main ;;
         dropin) if [ -z "$DROPIN_SAVED" ]; then
@@ -1203,7 +1209,7 @@ apply_file() {
         mkdir -p "$(dirname "$dst")" || die "не удалось создать каталог для $dst"
         : > "$tmp" && chmod 644 "$tmp" || { rm -f "$tmp"; die "не удалось создать $tmp"; }
     fi
-    if ! cat "$src" > "$tmp" || ! cmp -s "$src" "$tmp"; then rm -f "$tmp"; die "не удалось записать $dst (нет места на диске?)"; fi
+    if ! cat "$src" > "$tmp" || ! same_file "$src" "$tmp"; then rm -f "$tmp"; die "не удалось записать $dst (нет места на диске?)"; fi
     mv -f "$tmp" "$dst" || { rm -f "$tmp"; die "не удалось заменить $dst"; }
     if have restorecon; then restorecon "$dst" 2>/dev/null || true; fi
     case "$kind" in main|dropin) NEED_RELOAD=1 ;; esac
@@ -1229,7 +1235,7 @@ plan_banner() {
     if [ -L "$BANNER_FILE" ]; then
         warn "$BANNER_FILE — символическая ссылка, баннер не трогаю"; BANNER=no; return 0
     fi
-    if [ -f "$BANNER_FILE" ] && cmp -s "$TMPDIR_/banner" "$BANNER_FILE"; then
+    if [ -f "$BANNER_FILE" ] && same_file "$TMPDIR_/banner" "$BANNER_FILE"; then
         ok "баннер $BANNER_FILE уже актуален"
     else
         BANNER_CHANGED=1
@@ -1484,7 +1490,7 @@ do_rollback() {
     fi
     compute_ports
     note "откат: $SSHD_CONFIG <- $src"
-    if cmp -s "$src" "$SSHD_CONFIG"; then ok "$SSHD_CONFIG уже совпадает с $src"; else show_diff "$SSHD_CONFIG" "$src"; fi
+    if same_file "$src" "$SSHD_CONFIG"; then ok "$SSHD_CONFIG уже совпадает с $src"; else show_diff "$SSHD_CONFIG" "$src"; fi
     if [ "$DRY_RUN" = yes ]; then
         [ -f "$DROPIN_PATH" ] && change REMOVE "$DROPIN_PATH"
         [ -f "$BANNER_FILE.orig" ] && change RESTORE "$BANNER_FILE <- $BANNER_FILE.orig"
