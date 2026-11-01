@@ -39,6 +39,7 @@ CLIENT_ALIVE_INTERVAL="${CLIENT_ALIVE_INTERVAL:-}"   # по умолчанию 3
 CLIENT_ALIVE_COUNT_MAX="${CLIENT_ALIVE_COUNT_MAX:-}" # по умолчанию 2
 LOG_LEVEL="${LOG_LEVEL:-}"                       # пусто = не трогать
 DISABLE_ACCEPT_ENV="${DISABLE_ACCEPT_ENV:-yes}"  # комментировать все глобальные AcceptEnv
+ACCEPT_ENV="${ACCEPT_ENV:-}"                     # переменные, которые sshd всё же должен принимать (Proxmox: LC_PVE_TICKET)
 BANNER="${BANNER:-yes}"
 BANNER_FILE="${BANNER_FILE:-/etc/issue.net}"
 BANNER_ADMIN="${BANNER_ADMIN:-@whereisasan}"
@@ -97,6 +98,8 @@ secure_ssh.sh v$VERSION — безопасная настройка sshd + кл�
       --max-auth-tries N    (по умолчанию $D_MAX_AUTH_TRIES)
       --log-level V         LogLevel (по умолчанию не трогается)
       --keep-accept-env     не комментировать AcceptEnv (DISABLE_ACCEPT_ENV=no)
+      --accept-env "V1 V2"  принимать перечисленные переменные окружения (ACCEPT_ENV);
+                            на Proxmox VE автоматически LC_PVE_TICKET — без него не работает консоль VM с другой ноды
       --no-banner           не ставить баннер (BANNER=no)
       --banner-admin TEXT   подпись в баннере (BANNER_ADMIN=$BANNER_ADMIN)
       --mode auto|dropin|legacy  куда писать настройки (CONFIG_MODE=$CONFIG_MODE)
@@ -161,6 +164,7 @@ parse_args() {
             --max-auth-tries)    need_arg "$@"; MAX_AUTH_TRIES="$2"; shift 2 ;;
             --log-level)         need_arg "$@"; LOG_LEVEL="$2"; shift 2 ;;
             --keep-accept-env)   DISABLE_ACCEPT_ENV=no; shift ;;
+            --accept-env)        need_arg "$@"; ACCEPT_ENV="$2"; shift 2 ;;
             --no-banner)         BANNER=no; shift ;;
             --banner-admin)      need_arg "$@"; BANNER_ADMIN="$2"; shift 2 ;;
             --mode)              need_arg "$@"; CONFIG_MODE="$2"; shift 2 ;;
@@ -200,7 +204,7 @@ is_port()   { is_uint "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 # порт и прочие настройки к значениям по умолчанию.
 ST_PORTS=""; ST_PERMIT_ROOT_LOGIN=""; ST_ALLOW_TCP_FORWARDING=""; ST_X11_FORWARDING=""
 ST_MAX_AUTH_TRIES=""; ST_LOGIN_GRACE_TIME=""; ST_CLIENT_ALIVE_INTERVAL=""; ST_CLIENT_ALIVE_COUNT_MAX=""
-ST_LOG_LEVEL=""; ST_MODE=""; ST_RELOAD_PENDING=""
+ST_LOG_LEVEL=""; ST_MODE=""; ST_RELOAD_PENDING=""; ST_ACCEPT_ENV=""
 load_state() {
     [ -f "$STATE_FILE" ] || return 0
     while IFS='=' read -r k v || [ -n "$k" ]; do
@@ -216,6 +220,7 @@ load_state() {
             CLIENT_ALIVE_INTERVAL)  ST_CLIENT_ALIVE_INTERVAL="$v" ;;
             CLIENT_ALIVE_COUNT_MAX) ST_CLIENT_ALIVE_COUNT_MAX="$v" ;;
             LOG_LEVEL)              ST_LOG_LEVEL="$v" ;;
+            ACCEPT_ENV)             ST_ACCEPT_ENV="$v" ;;
             MODE)                   ST_MODE="$v" ;;
             RELOAD_PENDING)         ST_RELOAD_PENDING="$v" ;;
         esac
@@ -267,6 +272,10 @@ validate_params() {
     case "$GITHUB_USER" in
         ''|*[!A-Za-z0-9-]*) die "GITHUB_USER содержит недопустимые символы: '$GITHUB_USER'" ;;
     esac
+    ACCEPT_ENV=$(printf '%s' "$ACCEPT_ENV" | tr ',' ' ')
+    for v in $ACCEPT_ENV; do
+        case "$v" in *[!A-Za-z0-9_*?]*|[0-9]*) die "--accept-env: недопустимое имя переменной '$v'" ;; esac
+    done
     case "$DROPIN_NAME" in
         */*|'') die "DROPIN_NAME должен быть именем файла" ;;
         *.conf) ;;
@@ -521,6 +530,21 @@ detect_mode() {
         warn "в прошлый раз использовался режим $ST_MODE, сейчас $CONFIG_MODE"
     fi
     info "режим записи настроек: $CONFIG_MODE"
+    detect_pve
+}
+# Proxmox VE: консоль VM с другой ноды передаёт билет через переменную LC_PVE_TICKET по ssh,
+# миграция VM идёт через ssh-туннель с пробросом портов, ключи root кластер хранит в /etc/pve/priv.
+IS_PVE=0
+detect_pve() {
+    if [ -d /etc/pve ] || have pveversion; then IS_PVE=1; fi
+    [ "$IS_PVE" = 1 ] || return 0
+    if [ -z "$ACCEPT_ENV" ]; then
+        ACCEPT_ENV="LC_PVE_TICKET"
+        info "обнаружен Proxmox VE: sshd будет принимать LC_PVE_TICKET (консоль VM между нодами). Переопределить: --accept-env"
+    else
+        case " $ACCEPT_ENV " in *" LC_PVE_TICKET "*|*" LC_* "*) ;; *) warn "Proxmox VE: в --accept-env нет LC_PVE_TICKET — консоль VM с другой ноды работать не будет" ;; esac
+    fi
+    [ "$ALLOW_TCP_FORWARDING" = yes ] || warn "Proxmox VE: AllowTcpForwarding no сломает миграцию VM по ssh-туннелю"
 }
 
 # ---------- Перезагрузка sshd ----------
@@ -804,6 +828,14 @@ install_keys_for_user() {
         warn "$u: sshd не пустит этого пользователя: $ALLOW_REASON. Ключ поставлю, но входа не будет"
         can_login=0
     fi
+    if [ -L "$ak" ] && [ "$uid" = 0 ] && [ "$(file_uid "$ak")" = 0 ]; then
+        target=$(readlink -f "$ak" 2>/dev/null || true)
+        if [ -n "$target" ] && [ -d "$(dirname "$target")" ] && [ "$(file_uid "$(dirname "$target")")" = 0 ]; then
+            pve_note=""; [ "$IS_PVE" = 1 ] && pve_note=" (Proxmox: ключи root синхронизирует кластер)"
+            info "$u: $ak — ссылка root на $target$pve_note; пишу по целевому пути"
+            ak="$target"
+        fi
+    fi
     akdir=$(dirname "$ak")
     case "$ak" in
         "$h"/*) in_home=1 ;;
@@ -867,7 +899,9 @@ install_keys_for_user() {
         fi
         if [ -s "$newak" ] && [ -n "$(tail -c 1 "$newak")" ]; then printf '\n' >> "$newak"; fi
         printf '%s' "$add_list" >> "$newak" || { rm -f "$newak"; die "не удалось записать $newak"; }
-        if [ "$in_home" = 1 ]; then chmod 600 "$newak" && chown -h "$uid:$grp" "$newak"; else chmod 644 "$newak"; fi
+        if [ "$in_home" = 1 ]; then chmod 600 "$newak" && chown -h "$uid:$grp" "$newak"
+        elif [ "$uid" = 0 ]; then chmod 600 "$newak" 2>/dev/null || true     # /etc/pve (pmxcfs) может не поддерживать chmod
+        else chmod 644 "$newak"; fi
         mv -f "$newak" "$ak" || { rm -f "$newak"; die "не удалось заменить $ak"; }
         # права каталога: только для созданного нами ~/.ssh; домашний каталог (AuthorizedKeysFile %h/...) не трогаем
         if [ "$in_home" = 1 ] && [ "$akdir" != "$h" ] && [ "$(file_mode "$akdir")" != 700 ]; then
@@ -1043,6 +1077,7 @@ managed_directives() {
     printf 'AllowTcpForwarding %s\n' "$ALLOW_TCP_FORWARDING"
     if [ -n "$LOG_LEVEL" ]; then printf 'LogLevel %s\n' "$LOG_LEVEL"; fi
     if [ "$BANNER" = yes ]; then printf 'Banner %s\n' "$BANNER_FILE"; fi
+    if [ -n "$ACCEPT_ENV" ]; then printf 'AcceptEnv %s\n' "$ACCEPT_ENV"; fi
 }
 # Все значения директивы $1 в глобальной секции файла $2 (до первого Match), по одному в строке
 get_global_all() {
@@ -1059,15 +1094,15 @@ get_global() { get_global_all "$1" "$2" | head -n 1; }
 # Записать блок строк $2 (первая строка — "$1 значение", далее полные директивы) в глобальную секцию:
 # заменить первое вхождение $1, убрать его дубли, иначе вставить перед первым Include/Match или в конец.
 set_global() {
-    K="$1" BLOCK="$2" awk '
-        BEGIN { lk = tolower(ENVIRON["K"]); done = 0; inmatch = 0 }
+    K="$1" BLOCK="$2" KEEP="${4:-0}" awk '
+        BEGIN { lk = tolower(ENVIRON["K"]); done = 0; inmatch = 0; keep = ENVIRON["KEEP"] }
         {
             f = $1; sub(/=.*/, "", f); lf = tolower(f)
             if (lf == "match" || lf == "include") {
                 if (!done) { print ENVIRON["BLOCK"]; done = 1 }
                 if (lf == "match") inmatch = 1
             }
-            if (!inmatch && lf == lk) {
+            if (!inmatch && lf == lk && !keep) {
                 if (!done) { print ENVIRON["BLOCK"]; done = 1 }
                 next
             }
@@ -1075,13 +1110,20 @@ set_global() {
         }
         END { if (!done) print ENVIRON["BLOCK"] }' "$3"
 }
-# Закомментировать все активные строки директивы $1 в глобальной секции файла $2
+# insert_global KEY LINE FILE — вставить строку в глобальную секцию, не трогая существующие (накопительные директивы)
+insert_global() { set_global "$1" "$2" "$3" 1; }
+# Закомментировать все активные строки директивы $1 в глобальной секции файла $2,
+# кроме строки со значением $3 (если задано) — свою строку оставляем
 comment_global() {
-    K="$(lower "$1")" awk '
+    K="$(lower "$1")" KEEPVAL="${3:-}" awk '
         BEGIN { inmatch = 0 }
         { f = $1; sub(/=.*/, "", f); lf = tolower(f) }
         lf == "match" { inmatch = 1 }
-        !inmatch && lf == ENVIRON["K"] { print "#" $0 " # отключено secure_ssh.sh"; next }
+        !inmatch && lf == ENVIRON["K"] {
+            v = $0; sub(/^[ \t]*[^ \t=]+[ \t=]+/, "", v); sub(/[ \t]+$/, "", v)
+            if (ENVIRON["KEEPVAL"] != "" && v == ENVIRON["KEEPVAL"]) { print; next }
+            print "#" $0 " # отключено secure_ssh.sh"; next
+        }
         { print }' "$2"
 }
 show_diff() {  # $1 = текущий файл (может отсутствовать), $2 = новый
@@ -1094,6 +1136,11 @@ MAIN_CHANGES=""; DROPIN_CHANGED=0; MAIN_CHANGED=0
 # Собрать будущий $SSHD_CONFIG в $TMPDIR_/main.new и описать изменения (ничего не пишет)
 build_main() {
     cfg_lines "$SSHD_CONFIG" > "$TMPDIR_/main.new"
+    if [ "$DISABLE_ACCEPT_ENV" = yes ] && get_global_all AcceptEnv "$TMPDIR_/main.new" | grep -qvxF -- "${ACCEPT_ENV:-__none__}"; then
+        comment_global AcceptEnv "$TMPDIR_/main.new" "$ACCEPT_ENV" > "$TMPDIR_/main.tmp" && mv "$TMPDIR_/main.tmp" "$TMPDIR_/main.new"
+        MAIN_CHANGES="$MAIN_CHANGES
+  закомментированы глобальные AcceptEnv${ACCEPT_ENV:+ (кроме $ACCEPT_ENV)} (клиент не сможет навязать переменные окружения)"
+    fi
     if [ "$CONFIG_MODE" = dropin ]; then
         if [ -z "$INCLUDE_PATTERN" ]; then
             {
@@ -1125,6 +1172,13 @@ build_main() {
   Port: ${cur:-<по умолчанию 22>} -> $WANT_PORTS"
                 continue
             fi
+            if [ "$key" = AcceptEnv ]; then   # накопительная: добавляем свою строку, чужие активные (при --keep-accept-env) не трогаем
+                if get_global_all AcceptEnv "$TMPDIR_/main.new" | grep -qxF -- "$val"; then ok "AcceptEnv $val уже есть"; continue; fi
+                insert_global AcceptEnv "AcceptEnv $val" "$TMPDIR_/main.new" > "$TMPDIR_/main.tmp" && mv "$TMPDIR_/main.tmp" "$TMPDIR_/main.new"
+                MAIN_CHANGES="$MAIN_CHANGES
+  AcceptEnv $val (добавлено)"
+                continue
+            fi
             cur=$(get_global "$key" "$TMPDIR_/main.new")
             if [ "$(lower "$cur")" = "$(lower "$val")" ]; then ok "$key уже = $val"; continue; fi
             set_global "$key" "$key $val" "$TMPDIR_/main.new" > "$TMPDIR_/main.tmp" && mv "$TMPDIR_/main.tmp" "$TMPDIR_/main.new"
@@ -1132,11 +1186,6 @@ build_main() {
   $key: $cur -> $val"; else MAIN_CHANGES="$MAIN_CHANGES
   $key -> $val (добавлено)"; fi
         done < "$TMPDIR_/directives"
-    fi
-    if [ "$DISABLE_ACCEPT_ENV" = yes ] && [ -n "$(get_global AcceptEnv "$TMPDIR_/main.new")" ]; then
-        comment_global AcceptEnv "$TMPDIR_/main.new" > "$TMPDIR_/main.tmp" && mv "$TMPDIR_/main.tmp" "$TMPDIR_/main.new"
-        MAIN_CHANGES="$MAIN_CHANGES
-  закомментированы все глобальные AcceptEnv (клиент не сможет навязать переменные окружения)"
     fi
     if ! same_file "$TMPDIR_/main.new" "$SSHD_CONFIG"; then MAIN_CHANGED=1; fi
 }
@@ -1321,8 +1370,17 @@ verify_effective() {
         if same_set "$got" "$WANT_PORTS"; then ok "эффективно: Port $got"
         else MISMATCH=1; warn "эффективно: Port = '$got', ожидалось '$WANT_PORTS'. Строки Port: $(locate_directive Port)"; fi
     fi
+    got=$(eff_values "$efff" acceptenv | tr '\n' ' '); got=${got% }
+    if [ "$DISABLE_ACCEPT_ENV" = yes ]; then
+        if same_set "$got" "$ACCEPT_ENV"; then ok "эффективно: AcceptEnv ${got:-<нет>}"
+        else MISMATCH=1; warn "эффективно: AcceptEnv = '${got:-<нет>}', ожидалось '${ACCEPT_ENV:-<нет>}'. Вхождения: $(locate_directive AcceptEnv)"; fi
+    elif [ -n "$ACCEPT_ENV" ]; then
+        miss=""; for v in $ACCEPT_ENV; do in_list "$v" "$got" || miss="$miss $v"; done
+        if [ -z "$miss" ]; then ok "эффективно: AcceptEnv $got"; else MISMATCH=1; warn "эффективно: AcceptEnv = '$got', не хватает:$miss"; fi
+    fi
     while read -r key val; do
         [ "$key" = Port ] && continue
+        [ "$key" = AcceptEnv ] && continue
         k=$(lower "$key"); v=$(lower "$val")
         got=$(eff_value "$efff" "$k")
         [ "$k" = permitrootlogin ] && [ "$v" = prohibit-password ] && v=without-password
@@ -1403,6 +1461,7 @@ write_state() {
         printf 'LOGIN_GRACE_TIME=%s\nCLIENT_ALIVE_INTERVAL=%s\nCLIENT_ALIVE_COUNT_MAX=%s\n' \
             "$LOGIN_GRACE_TIME" "$CLIENT_ALIVE_INTERVAL" "$CLIENT_ALIVE_COUNT_MAX"
         [ -n "$LOG_LEVEL" ] && printf 'LOG_LEVEL=%s\n' "$LOG_LEVEL"
+        [ -n "$ACCEPT_ENV" ] && printf 'ACCEPT_ENV=%s\n' "$ACCEPT_ENV"
         [ "$RELOAD_FAILED" = 1 ] && printf 'RELOAD_PENDING=1\n'
     } > "$TMPDIR_/state.new"
     apply_file "$TMPDIR_/state.new" "$STATE_FILE" state
@@ -1531,6 +1590,7 @@ main() {
     pick CLIENT_ALIVE_INTERVAL "$ST_CLIENT_ALIVE_INTERVAL" "$D_CLIENT_ALIVE_INTERVAL"
     pick CLIENT_ALIVE_COUNT_MAX "$ST_CLIENT_ALIVE_COUNT_MAX" "$D_CLIENT_ALIVE_COUNT_MAX"
     pick LOG_LEVEL "$ST_LOG_LEVEL" ""
+    pick ACCEPT_ENV "$ST_ACCEPT_ENV" ""
     validate_params
     [ -n "$STICKY_NOTE" ] && info "значения из прошлого запуска:$STICKY_NOTE (явный флаг их переопределяет, --reset сбрасывает)"
     precheck_config
