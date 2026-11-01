@@ -12,6 +12,15 @@ HERE=$(cd "$(dirname "$0")" && pwd); SCRIPT="$HERE/../secure_ssh.sh"
 [ "$(id -u)" -eq 0 ] || { echo "нужен root"; exit 1; }
 command -v sshd >/dev/null 2>&1 || SSHD=/usr/sbin/sshd; SSHD=${SSHD:-$(command -v sshd)}
 T=$(mktemp -d); trap 'cleanup_all' EXIT
+# Версия sshd: до 8.2 нет Include, конфиги и проверки drop-in не применимы (режим legacy).
+# SSHD_FAKE_OLD=1 имитирует старый sshd на новой системе (подменяется только вывод -V).
+if [ -n "${SSHD_FAKE_OLD:-}" ]; then
+    mkdir -p "$T/bin"; printf '#!/bin/sh\n[ "$1" = -V ] && { echo "OpenSSH_7.6p1 fake" >&2; exit 0; }\nexec %s "$@"\n' "$SSHD" > "$T/bin/sshd-old"; chmod +x "$T/bin/sshd-old"
+    export SSHD_BIN="$T/bin/sshd-old"
+fi
+SSHD_VER=$(${SSHD_BIN:-$SSHD} -V 2>&1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+' | head -n 1 | sed 's/OpenSSH_//')
+V_MAJ=${SSHD_VER%%.*}; V_MIN=${SSHD_VER#*.}
+HAS_INCLUDE=0; if [ "$V_MAJ" -gt 8 ] || { [ "$V_MAJ" -eq 8 ] && [ "$V_MIN" -ge 2 ]; }; then HAS_INCLUDE=1; fi
 PASS=0; FAIL=0; CUR=""
 SSHD_PIDS=""
 cleanup_all() {
@@ -24,6 +33,8 @@ fail() { FAIL=$((FAIL + 1)); echo "  FAIL [$CUR] $1"; }
 assert()     { if eval "$2" >/dev/null 2>&1; then pass; else fail "$1"; fi; }
 assert_out() { if grep -q -- "$2" "$OUT"; then pass; else fail "$1 (ожидалось в выводе: $2)"; fi; }
 assert_rc()  { if [ "$RC" = "$1" ]; then pass; else fail "код выхода $RC, ожидался $1"; sed 's/^/      | /' "$OUT"; fi; }
+# Проверка только для систем с Include (drop-in); на старых sshd засчитывается как пройденная
+assert_dropin() { if [ "$HAS_INCLUDE" = 1 ]; then assert "$1" "$2"; else pass; fi; }
 begin() { CUR="$1"; echo "* $1"; }
 same_f() { [ "$(cksum < "$1")" = "$(cksum < "$2")" ]; }   # cmp есть не во всех образах
 # Занять порт посторонним процессом (OpenBSD nc, ncat или busybox nc); pid в $T/nc.pid
@@ -57,10 +68,14 @@ if [ -n "${AWK_IMPL:-}" ]; then printf '#!/bin/sh\nexec %s "$@"\n' "$AWK_IMPL" >
 export PATH="$BIN:$PATH"
 
 # Конфиги
-cfg_ubuntu() {  # Include + Port 2222 + cloud-init drop-in с паролями
+cfg_ubuntu() {  # Include + Port 2222 + cloud-init drop-in с паролями (на sshd < 8.2 — без Include, пароли в main)
     mkdir -p "$1/sshd_config.d"
-    printf 'Include %s/sshd_config.d/*.conf\nPort 2222\nKbdInteractiveAuthentication no\nUsePAM yes\nX11Forwarding yes\nPrintMotd no\nAcceptEnv LANG LC_*\nSubsystem sftp /usr/lib/openssh/sftp-server\n' "$1" > "$1/sshd_config"
-    printf 'PasswordAuthentication yes\n' > "$1/sshd_config.d/50-cloud-init.conf"
+    if [ "$HAS_INCLUDE" = 1 ]; then
+        printf 'Include %s/sshd_config.d/*.conf\nPort 2222\nKbdInteractiveAuthentication no\nUsePAM yes\nX11Forwarding yes\nPrintMotd no\nAcceptEnv LANG LC_*\nSubsystem sftp /usr/lib/openssh/sftp-server\n' "$1" > "$1/sshd_config"
+        printf 'PasswordAuthentication yes\n' > "$1/sshd_config.d/50-cloud-init.conf"
+    else
+        printf 'Port 2222\nPasswordAuthentication yes\nUsePAM yes\nX11Forwarding yes\nPrintMotd no\nAcceptEnv LANG LC_*\nSubsystem sftp /usr/lib/openssh/sftp-server\n' > "$1/sshd_config"
+    fi
 }
 cfg_legacy() {  # без Include, с Match и несколькими AcceptEnv (как на RHEL)
     mkdir -p "$1/sshd_config.d"
@@ -81,7 +96,7 @@ new_case() { d="$T/$1"; rm -rf "$d"; mkdir -p "$d"; reset_user; printf '%s' "$d"
 begin "drop-in: базовый запуск"
 D=$(new_case c1); cfg_ubuntu "$D"; run "$D" --no-reload
 assert_rc 0
-assert "drop-in создан" "[ -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
+assert_dropin "drop-in создан" "[ -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
 assert "PasswordAuthentication no эффективно" "[ \"\$(eff '$D' passwordauthentication)\" = no ]"
 assert "порт не тронут" "[ \"\$(eff '$D' port)\" = 2222 ]"
 assert "AcceptEnv закомментирован" "[ -z \"\$(eff '$D' acceptenv)\" ]"
@@ -97,14 +112,14 @@ n_before=$(ls "$D"/sshd_config.bak.* | wc -l); run "$D" --no-reload
 assert_rc 0
 assert "новых бэкапов нет" "[ \"\$(ls '$D'/sshd_config.bak.* | wc -l)\" = \"$n_before\" ]"
 assert_out "ключи уже есть" "все 2 ключ"
-assert_out "drop-in актуален" "уже актуален"
+assert "drop-in актуален / main без изменений" "grep -q 'уже актуален\|без изменений' '$OUT'"
 
 # --- 2. порты ---
 begin "drop-in: смена порта с сохранением старого"
 run "$D" --no-reload --port 2345
 assert_rc 0
 assert "оба порта эффективны" "eff '$D' port | sort | tr '\n' ' ' | grep -q '^2222 2345 \$'"
-assert "Port в main закомментирован" "! grep -qE '^Port' '$D/sshd_config'"
+assert_dropin "Port в main закомментирован" "! grep -qE '^Port' '$D/sshd_config'"
 assert_out "предупреждение про старый порт" "старый порт остаётся"
 begin "drop-in: порт сохраняется при повторном запуске без --port"
 run "$D" --no-reload
@@ -142,11 +157,13 @@ assert "все AcceptEnv выключены" "[ -z \"\$(eff '$D' acceptenv)\" ]"
 assert "Match сохранён последним" "awk 'tolower(\$1)==\"match\"{m=NR} tolower(\$1)==\"passwordauthentication\"&&!m{p=NR} END{exit !(p && m && p<m)}' '$D/sshd_config'"
 assert "ChrootDirectory внутри Match цел" "grep -q 'ChrootDirectory /srv' '$D/sshd_config'"
 run "$D" --no-reload --mode legacy; assert_rc 0; assert_out "legacy идемпотентен" "без изменений"
+if [ "$HAS_INCLUDE" = 1 ]; then
 begin "legacy при наличии Include: директивы выше Include"
 D=$(new_case c4b); cfg_ubuntu "$D"; run "$D" --no-reload --mode legacy
 assert_rc 0
 assert "drop-in cloud-init перекрыт" "[ \"\$(eff '$D' passwordauthentication)\" = no ]"
 assert "PasswordAuthentication стоит выше Include" "awk 'tolower(\$1)==\"include\"{i=NR} tolower(\$1)==\"passwordauthentication\"&&!p{p=NR} END{exit !(p && i && p<i)}' '$D/sshd_config'"
+fi
 
 # --- 5. защита от lockout ---
 begin "lockout: PermitRootLogin no + только root -> отказ"
@@ -177,7 +194,7 @@ begin "только ограниченные ключи у единственн�
 D=$(new_case c6r); cfg_ubuntu "$D"; mkdir -p "$H/.ssh"; chmod 700 "$H/.ssh"
 printf 'command="echo no" ssh-ed25519 %s c\ncommand="echo no" ssh-rsa %s c\n' "$K1" "$K2" > "$AK"; chmod 600 "$AK"; chown -R sst_user "$H/.ssh"
 run "$D" --no-reload; assert_rc 1; assert_out "сообщение" "не сможет никто"
-assert "конфиг не тронут" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
+assert "конфиг не тронут" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ] && [ ! -f '$D/sshd_config.orig' ]"
 begin "нестандартный AuthorizedKeysFile"
 D=$(new_case c6b); cfg_ubuntu "$D"; printf 'AuthorizedKeysFile %s/ak/%%u\n' "$D" >> "$D/sshd_config"
 run "$D" --no-reload; assert_rc 0
@@ -256,7 +273,7 @@ run "$D" --no-reload; assert_rc 0
 printf 'PasswordAuthentication yes\n' >> "$D/sshd_config.orig"   # отличие, чтобы увидеть восстановление
 run "$D" --rollback --no-reload; assert_rc 0
 assert "main восстановлен из .orig" "same_f '$D/sshd_config' '$D/sshd_config.orig'"
-assert "drop-in удалён" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
+assert_dropin "drop-in удалён" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
 assert "state удалён" "[ ! -f '$D/state' ]"
 begin "--rollback ФАЙЛ без .orig не создаёт поддельный .orig"
 run "$D" --no-reload; assert_rc 0; rm -f "$D/sshd_config.orig"; cp "$D/sshd_config" "$D/modified.conf"
@@ -269,19 +286,19 @@ begin "--confirm без подтверждения -> откат, код 3"
 D=$(new_case c8b); cfg_ubuntu "$D"; cp "$D/sshd_config" "$T/pristine"
 run "$D" --no-reload --confirm 2 < /dev/null
 assert_rc 3; assert "main восстановлен" "same_f '$D/sshd_config' '$T/pristine'"
-assert "drop-in удалён" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
+assert_dropin "drop-in удалён" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
 begin "--confirm: SIGHUP (обрыв сессии) во время ожидания -> откат, код 3"
 D=$(new_case c8d); cfg_ubuntu "$D"; cp "$D/sshd_config" "$T/pristine"
 SSHD_CONFIG="$D/sshd_config" BANNER_FILE="$D/issue.net" STATE_FILE="$D/state" KEYS_FILE="$T/keys" TARGET_USERS=sst_user YES=yes CONFIRM_FILE="$D/confirmed" \
     $SHELL_UNDER_TEST "$SCRIPT" --no-reload --confirm 30 > "$D/out.txt" 2>&1 < /dev/null & SP=$!
 sleep 4; kill -HUP $SP 2>/dev/null; wait $SP; RC=$?; OUT="$D/out.txt"
-assert_rc 3; assert "main восстановлен" "same_f '$D/sshd_config' '$T/pristine'"; assert "drop-in удалён" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
+assert_rc 3; assert "main восстановлен" "same_f '$D/sshd_config' '$T/pristine'"; assert_dropin "drop-in удалён" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
 begin "--confirm: SIGKILL основного процесса -> сторож откатывает сам"
 D=$(new_case c8e); cfg_ubuntu "$D"; cp "$D/sshd_config" "$T/pristine"
 SSHD_CONFIG="$D/sshd_config" BANNER_FILE="$D/issue.net" STATE_FILE="$D/state" KEYS_FILE="$T/keys" TARGET_USERS=sst_user YES=yes CONFIRM_FILE="$D/confirmed" \
     $SHELL_UNDER_TEST "$SCRIPT" --no-reload --confirm 2 > "$D/out.txt" 2>&1 < /dev/null & SP=$!
 sleep 3; kill -9 $SP 2>/dev/null; wait $SP 2>/dev/null; sleep 7
-assert "сторож восстановил main" "same_f '$D/sshd_config' '$T/pristine'"; assert "сторож удалил drop-in" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
+assert "сторож восстановил main" "same_f '$D/sshd_config' '$T/pristine'"; assert_dropin "сторож удалил drop-in" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
 assert "журнал сторожа" "grep -q 'сторож' '$D/.secure_ssh.watchdog.log'"
 begin "--confirm с подтверждением файлом"
 D=$(new_case c8c); cfg_ubuntu "$D"
@@ -293,7 +310,7 @@ wait
 # --- 9. CRLF и privsep ---
 begin "CRLF-конфиг распознаётся"
 D=$(new_case c9); cfg_ubuntu "$D"; sed -i 's/$/\r/' "$D/sshd_config"; run "$D" --no-reload
-assert_rc 0; assert_out "режим dropin" "режим записи настроек: dropin"; assert "пароли выключены" "[ \"\$(eff '$D' passwordauthentication)\" = no ]"
+assert_rc 0; if [ "$HAS_INCLUDE" = 1 ]; then assert_out "режим dropin" "режим записи настроек: dropin"; else assert_out "режим legacy" "режим записи настроек: legacy"; fi; assert "пароли выключены" "[ \"\$(eff '$D' passwordauthentication)\" = no ]"
 
 # --- 10. реальный sshd: SIGHUP, проверка живости, откат при мёртвом порте ---
 begin "реальный sshd: смена порта через SIGHUP"
@@ -340,5 +357,5 @@ assert "конфиг откачен (порт $P3 отсутствует)" "! ef
 kill "$(cat "$D/sshd.pid" 2>/dev/null)" 2>/dev/null
 
 echo
-echo "Итого: пройдено $PASS, провалено $FAIL (шелл: $SHELL_UNDER_TEST, awk: ${AWK_IMPL:-системный})"
+echo "Итого: пройдено $PASS, провалено $FAIL (шелл: $SHELL_UNDER_TEST, awk: ${AWK_IMPL:-системный}, OpenSSH $SSHD_VER, Include: $HAS_INCLUDE)"
 [ "$FAIL" -eq 0 ]
