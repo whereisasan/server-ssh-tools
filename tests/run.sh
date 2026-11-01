@@ -211,7 +211,7 @@ run "$D" --no-reload; assert_rc 1; assert_out "причина" "нет в AllowU
 printf 'AllowUsers someoneelse sst_user\n' >> "$D/sshd_config"; sed -i '0,/^AllowUsers someoneelse$/{/^AllowUsers someoneelse$/d}' "$D/sshd_config"
 run "$D" --no-reload; assert_rc 0
 begin "PubkeyAcceptedAlgorithms без типа ключа -> отказ"
-D=$(new_case c6j); cfg_ubuntu "$D"; printf 'PubkeyAcceptedAlgorithms ssh-ed25519\n' >> "$D/sshd_config"
+D=$(new_case c6j); cfg_ubuntu "$D"; printf 'PubkeyAcceptedKeyTypes ssh-ed25519\n' >> "$D/sshd_config"   # старое имя: понимают и 7.x/8.4, и новые версии
 cp "$T/k2.pub" "$T/rsa-only.keys"
 SSHD_CONFIG="$D/sshd_config" BANNER_FILE="$D/issue.net" STATE_FILE="$D/state" KEYS_FILE="$T/rsa-only.keys" TARGET_USERS=sst_user $SHELL_UNDER_TEST "$SCRIPT" --no-reload > "$D/out.txt" 2>&1; RC=$?; OUT="$D/out.txt"
 assert_rc 1; assert_out "причина" "не входит в PubkeyAcceptedAlgorithms"
