@@ -25,6 +25,7 @@ assert()     { if eval "$2" >/dev/null 2>&1; then pass; else fail "$1"; fi; }
 assert_out() { if grep -q -- "$2" "$OUT"; then pass; else fail "$1 (ожидалось в выводе: $2)"; fi; }
 assert_rc()  { if [ "$RC" = "$1" ]; then pass; else fail "код выхода $RC, ожидался $1"; sed 's/^/      | /' "$OUT"; fi; }
 begin() { CUR="$1"; echo "* $1"; }
+same_f() { [ "$(cksum < "$1")" = "$(cksum < "$2")" ]; }   # cmp есть не во всех образах
 # Занять порт посторонним процессом (OpenBSD nc, ncat или busybox nc); pid в $T/nc.pid
 listen_port() {
     if nc -h 2>&1 | grep -qi busybox; then nc -l -p "$1" -s 127.0.0.1 >/dev/null 2>&1 & else nc -l 127.0.0.1 "$1" >/dev/null 2>&1 & fi
@@ -44,6 +45,8 @@ port_open() {
 if ! id sst_user >/dev/null 2>&1; then
     useradd -m -s /bin/sh sst_user 2>/dev/null || adduser -D -s /bin/sh sst_user
 fi
+# Заблокированный аккаунт (пароль "!") sshd без PAM не пускает даже по ключу (Alpine): ставим случайный пароль
+printf 'sst_user:%s\n' "$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')" | chpasswd 2>/dev/null || true
 H=$(getent passwd sst_user | cut -d: -f6)
 ssh-keygen -q -t ed25519 -N '' -f "$T/k1" && ssh-keygen -q -t rsa -b 2048 -N '' -f "$T/k2"
 cat "$T/k1.pub" "$T/k2.pub" > "$T/keys"
@@ -224,14 +227,14 @@ D=$(new_case c7); cfg_ubuntu "$D"; cp "$D/sshd_config" "$T/pristine"
 printf '#!/bin/sh\nif [ "$1" = -t ] && grep -q PermitEmptyPasswords "$3" 2>/dev/null; then echo "fake: bad option" >&2; exit 255; fi\nexec %s "$@"\n' "$SSHD" > "$BIN/sshd-fail"; chmod +x "$BIN/sshd-fail"
 SSHD_BIN="$BIN/sshd-fail" run "$D" --no-reload --mode legacy
 assert_rc 1; assert_out "ошибка валидации" "не проходит sshd -t"
-assert "main не тронут" "[ ! -f '$D/sshd_config.orig' ] && cmp -s '$D/sshd_config' '$T/pristine' && [ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
+assert "main не тронут" "[ ! -f '$D/sshd_config.orig' ] && same_f '$D/sshd_config' '$T/pristine' && [ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
 begin "нет места на диске -> отказ, конфиг цел"
 TMPFS="$T/tmpfs"; mkdir -p "$TMPFS"
 if mount -t tmpfs -o size=24k tmpfs "$TMPFS" 2>/dev/null; then
     reset_user; cfg_legacy "$TMPFS"; cp "$TMPFS/sshd_config" "$T/pristine"
     dd if=/dev/zero of="$TMPFS/filler" bs=1k count=20 2>/dev/null; dd if=/dev/zero of="$TMPFS/filler2" bs=1 count=4000 2>/dev/null
     run "$TMPFS" --no-reload --mode legacy
-    assert_rc 1; assert "конфиг не изменён" "cmp -s '$TMPFS/sshd_config' '$T/pristine'"
+    assert_rc 1; assert "конфиг не изменён" "same_f '$TMPFS/sshd_config' '$T/pristine'"
     assert "нет пустых бэкапов" "! find '$TMPFS' -name 'sshd_config.*' -size 0 | grep -q ."
     umount "$TMPFS"; TMPFS=""
 else
@@ -252,7 +255,7 @@ begin "--rollback"
 run "$D" --no-reload; assert_rc 0
 printf 'PasswordAuthentication yes\n' >> "$D/sshd_config.orig"   # отличие, чтобы увидеть восстановление
 run "$D" --rollback --no-reload; assert_rc 0
-assert "main восстановлен из .orig" "cmp -s '$D/sshd_config' '$D/sshd_config.orig'"
+assert "main восстановлен из .orig" "same_f '$D/sshd_config' '$D/sshd_config.orig'"
 assert "drop-in удалён" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
 assert "state удалён" "[ ! -f '$D/state' ]"
 begin "--rollback ФАЙЛ без .orig не создаёт поддельный .orig"
@@ -265,20 +268,20 @@ run "$D" --check; assert_rc 0; assert_out "порт из ListenAddress" "2223"
 begin "--confirm без подтверждения -> откат, код 3"
 D=$(new_case c8b); cfg_ubuntu "$D"; cp "$D/sshd_config" "$T/pristine"
 run "$D" --no-reload --confirm 2 < /dev/null
-assert_rc 3; assert "main восстановлен" "cmp -s '$D/sshd_config' '$T/pristine'"
+assert_rc 3; assert "main восстановлен" "same_f '$D/sshd_config' '$T/pristine'"
 assert "drop-in удалён" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
 begin "--confirm: SIGHUP (обрыв сессии) во время ожидания -> откат, код 3"
 D=$(new_case c8d); cfg_ubuntu "$D"; cp "$D/sshd_config" "$T/pristine"
 SSHD_CONFIG="$D/sshd_config" BANNER_FILE="$D/issue.net" STATE_FILE="$D/state" KEYS_FILE="$T/keys" TARGET_USERS=sst_user YES=yes CONFIRM_FILE="$D/confirmed" \
     $SHELL_UNDER_TEST "$SCRIPT" --no-reload --confirm 30 > "$D/out.txt" 2>&1 < /dev/null & SP=$!
 sleep 4; kill -HUP $SP 2>/dev/null; wait $SP; RC=$?; OUT="$D/out.txt"
-assert_rc 3; assert "main восстановлен" "cmp -s '$D/sshd_config' '$T/pristine'"; assert "drop-in удалён" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
+assert_rc 3; assert "main восстановлен" "same_f '$D/sshd_config' '$T/pristine'"; assert "drop-in удалён" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
 begin "--confirm: SIGKILL основного процесса -> сторож откатывает сам"
 D=$(new_case c8e); cfg_ubuntu "$D"; cp "$D/sshd_config" "$T/pristine"
 SSHD_CONFIG="$D/sshd_config" BANNER_FILE="$D/issue.net" STATE_FILE="$D/state" KEYS_FILE="$T/keys" TARGET_USERS=sst_user YES=yes CONFIRM_FILE="$D/confirmed" \
     $SHELL_UNDER_TEST "$SCRIPT" --no-reload --confirm 2 > "$D/out.txt" 2>&1 < /dev/null & SP=$!
 sleep 3; kill -9 $SP 2>/dev/null; wait $SP 2>/dev/null; sleep 7
-assert "сторож восстановил main" "cmp -s '$D/sshd_config' '$T/pristine'"; assert "сторож удалил drop-in" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
+assert "сторож восстановил main" "same_f '$D/sshd_config' '$T/pristine'"; assert "сторож удалил drop-in" "[ ! -f '$D/sshd_config.d/00-secure-ssh.conf' ]"
 assert "журнал сторожа" "grep -q 'сторож' '$D/.secure_ssh.watchdog.log'"
 begin "--confirm с подтверждением файлом"
 D=$(new_case c8c); cfg_ubuntu "$D"
