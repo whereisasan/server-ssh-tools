@@ -240,6 +240,29 @@ D=$(new_case c6e); cfg_ubuntu "$D"; printf 'Not Found\n' > "$T/bad.keys"
 SSHD_CONFIG="$D/sshd_config" BANNER_FILE="$D/issue.net" STATE_FILE="$D/state" KEYS_FILE="$T/bad.keys" TARGET_USERS=sst_user $SHELL_UNDER_TEST "$SCRIPT" --no-reload > "$D/out.txt" 2>&1; RC=$?; OUT="$D/out.txt"
 assert_rc 1; assert "ничего не записано" "[ ! -f '$D/sshd_config.orig' ]"
 
+# --- 6b. Proxmox VE ---
+begin "--accept-env: переменная принимается, остальные AcceptEnv выключены (dropin и legacy)"
+D=$(new_case c6p); cfg_ubuntu "$D"; run "$D" --no-reload --accept-env LC_PVE_TICKET
+assert_rc 0; assert "только LC_PVE_TICKET" "[ \"\$(eff '$D' acceptenv | tr '\n' ' ')\" = 'LC_PVE_TICKET ' ]"
+run "$D" --no-reload; assert_rc 0; assert "accept-env запомнен" "[ \"\$(eff '$D' acceptenv)\" = LC_PVE_TICKET ]"
+D=$(new_case c6pl); cfg_legacy "$D"; run "$D" --no-reload --mode legacy --accept-env LC_PVE_TICKET
+assert_rc 0; assert "legacy: только LC_PVE_TICKET" "[ \"\$(eff '$D' acceptenv | tr '\n' ' ')\" = 'LC_PVE_TICKET ' ]"
+run "$D" --no-reload --mode legacy; assert_rc 0; assert_out "legacy идемпотентен с AcceptEnv" "без изменений"
+begin "--keep-accept-env + --accept-env: чужие AcceptEnv остаются, своя добавляется"
+D=$(new_case c6pk); cfg_legacy "$D"; run "$D" --no-reload --mode legacy --keep-accept-env --accept-env LC_PVE_TICKET
+assert_rc 0; assert "LANG остался" "eff '$D' acceptenv | grep -qx LANG"; assert "LC_PVE_TICKET добавлен" "eff '$D' acceptenv | grep -qx LC_PVE_TICKET"
+begin "Proxmox определяется автоматически (pveversion в PATH)"
+D=$(new_case c6pv); cfg_ubuntu "$D"; printf '#!/bin/sh\necho pve-manager/8.2\n' > "$BIN/pveversion"; chmod +x "$BIN/pveversion"
+run "$D" --no-reload; rm -f "$BIN/pveversion"
+assert_rc 0; assert_out "сообщение о Proxmox" "обнаружен Proxmox VE"; assert "LC_PVE_TICKET принимается" "[ \"\$(eff '$D' acceptenv)\" = LC_PVE_TICKET ]"
+begin "Proxmox: authorized_keys root — симлинк в /etc/pve/priv (эмуляция)"
+D=$(new_case c6ps); cfg_ubuntu "$D"; mkdir -p "$D/pve/priv" "$D/rootssh"; chmod 700 "$D/pve/priv"
+: > "$D/pve/priv/authorized_keys"; ln -s "$D/pve/priv/authorized_keys" "$D/rootssh/authorized_keys"
+printf 'AuthorizedKeysFile %s/rootssh/authorized_keys\n' "$D" >> "$D/sshd_config"
+USERS_OVERRIDE=root; run "$D" --no-reload; USERS_OVERRIDE=""
+assert_rc 0; assert_out "ссылка распознана" "ссылка root на"
+assert "ссылка цела" "[ -L '$D/rootssh/authorized_keys' ]"; assert "ключ записан по целевому пути" "grep -q \"$K1\" '$D/pve/priv/authorized_keys'"
+
 # --- 7. сбои записи ---
 begin "будущая конфигурация не проходит sshd -t -> ничего не записано"
 D=$(new_case c7); cfg_ubuntu "$D"; cp "$D/sshd_config" "$T/pristine"

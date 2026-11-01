@@ -80,6 +80,7 @@ sudo ./secure_ssh.sh -u <github> --confirm 120
 | `--max-auth-tries N` | `MAX_AUTH_TRIES` | `6` | см. FAQ про ssh-agent |
 | `--log-level V` | `LOG_LEVEL` | не трогать | `LogLevel` |
 | `--keep-accept-env` | `DISABLE_ACCEPT_ENV=no` | комментировать | не трогать `AcceptEnv` |
+| `--accept-env "V1 V2"` | `ACCEPT_ENV` | на Proxmox `LC_PVE_TICKET` | переменные окружения, которые sshd должен принимать |
 | `--no-banner` | `BANNER=no` | баннер ставится | |
 | `--banner-admin TEXT` | `BANNER_ADMIN` | `@whereisasan` | подпись в баннере |
 | `--mode auto\|dropin\|legacy` | `CONFIG_MODE` | `auto` | куда писать настройки |
@@ -112,7 +113,7 @@ sudo ./secure_ssh.sh -u <github> --confirm 120
 (+ `ChallengeResponseAuthentication no` для OpenSSH < 8.7), `LoginGraceTime`, `MaxAuthTries`,
 `ClientAliveInterval`, `ClientAliveCountMax`, `X11Forwarding`, `AllowTcpForwarding`, `LogLevel` (только если
 задан), `Banner`. Все глобальные строки `AcceptEnv` комментируются (директива накопительная, иначе её не
-отключить), кроме `--keep-accept-env`.
+отключить), кроме `--keep-accept-env`; переменные из `--accept-env` при этом остаются разрешёнными.
 
 Режимы записи:
 
@@ -133,6 +134,27 @@ sudo ./secure_ssh.sh -u <github> --confirm 120
 назначения и атомарно переименовывается; символические ссылки на месте `~/.ssh` или `authorized_keys` — отказ.
 Для каждого пользователя проверяется, что sshd вообще пустит его (`AllowUsers`/`AllowGroups`/`DenyUsers`/
 `DenyGroups`) и что тип ключа входит в `PubkeyAcceptedAlgorithms`.
+
+## Proxmox VE
+
+Скрипт определяет ноду Proxmox (каталог `/etc/pve` или команда `pveversion`) и учитывает три особенности:
+
+- **Консоль VM с другой ноды.** Нода подключается к ноде с VM по ssh и передаёт билет доступа переменной
+  окружения `LC_PVE_TICKET`. Если sshd её не принимает, консоль падает с ошибкой
+  `LC_PVE_TICKET not set, VNC proxy without password is forbidden`. На Proxmox скрипт автоматически добавляет
+  `AcceptEnv LC_PVE_TICKET`, остальные `AcceptEnv` по-прежнему отключаются. Выполнить нужно на каждой ноде.
+- **Ключи root.** `/root/.ssh/authorized_keys` на ноде является ссылкой на `/etc/pve/priv/authorized_keys`,
+  который кластер синхронизирует между нодами. Для root скрипт следует такой ссылке (только если ссылка и
+  целевой каталог принадлежат root) и пишет ключи по целевому пути, не ломая ссылку.
+- **Миграция VM** идёт через ssh-туннель с пробросом портов: `AllowTcpForwarding` должен оставаться `yes`
+  (значение по умолчанию); при `no` скрипт предупреждает.
+
+Если нода уже была настроена старой версией скрипта и консоль не открывается, достаточно запустить новую версию
+ещё раз на каждой ноде. Ручной вариант без скрипта:
+
+```sh
+echo 'AcceptEnv LC_PVE_TICKET' > /etc/ssh/sshd_config.d/10-proxmox.conf && sshd -t && systemctl reload ssh
+```
 
 ## Смена порта
 
