@@ -44,16 +44,12 @@ jobs:
         if: ${{ matrix.legacy }}
         shell: sh
         run: |
-          sed -i 's|archive.ubuntu.com|old-releases.ubuntu.com|g; s|security.ubuntu.com|old-releases.ubuntu.com|g' /etc/apt/sources.list
           apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates >/dev/null
           curl -fsSL "https://codeload.github.com/${GITHUB_REPOSITORY}/tar.gz/${GITHUB_SHA}" | tar xz --strip-components=1
       - name: install deps
         shell: sh
         run: |
           if command -v apt-get >/dev/null; then
-            if grep -q 'bionic' /etc/os-release 2>/dev/null; then
-              sed -i 's|archive.ubuntu.com|old-releases.ubuntu.com|g; s|security.ubuntu.com|old-releases.ubuntu.com|g' /etc/apt/sources.list
-            fi
             if grep -q 'bullseye' /etc/os-release 2>/dev/null; then
               # bullseye: security-репозиторий переехал в архив
               printf 'deb http://archive.debian.org/debian bullseye main\ndeb http://archive.debian.org/debian-security bullseye-security main\n' > /etc/apt/sources.list
